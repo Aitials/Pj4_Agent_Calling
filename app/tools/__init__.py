@@ -1,8 +1,13 @@
-"""工具层（本期预留，暂不实现具体工具）。
+"""Agent 工具层。
 
-后续在此目录新增 LangChain @tool 函数，例如：
-- 好客搜客户列表 / 通话记录 / ASR 转写拉取
-- 飞书任务创建与结果回写
-
-新增后在 Agent 初始化时通过 bind_tools 注入，接口定义见根目录「接口说明.md」。
+新增工具后在这里登记到 ALL_TOOLS，Agent 初始化时自动注入。
 """
+
+from __future__ import annotations
+
+from app.tools.customer_query import query_customer_profile
+from app.tools.haokesou_customers import export_haokesou_customers
+
+ALL_TOOLS = [export_haokesou_customers, query_customer_profile]
+
+__all__ = ["ALL_TOOLS", "export_haokesou_customers", "query_customer_profile"]

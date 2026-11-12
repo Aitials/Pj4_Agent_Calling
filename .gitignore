@@ -6,3 +6,7 @@ __pycache__/
 .idea/
 .idea/workspace.xml
 state/
+
+# ===== 设计文档（暂不公开）=====
+*.md
+!README.md
