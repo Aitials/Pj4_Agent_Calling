@@ -4,7 +4,7 @@
 -- 说明：业务库已存在，本脚本只建表；如需一并建库，取消下方注释
 -- ============================================================
 
--- CREATE DATABASE IF NOT EXISTS `ai_calling`
+-- CREATE DATABASE IF NOT EXISTS `pj5_agent_calling`
 --   DEFAULT CHARACTER SET utf8mb4
 --   DEFAULT COLLATE utf8mb4_0900_ai_ci;
 USE `pj5_agent_calling`;
