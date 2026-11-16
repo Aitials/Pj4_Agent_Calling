@@ -1,10 +1,21 @@
 -- ============================================================
--- 销售对话历史表
--- 保存销售与 Agent 的消息，用于短期上下文拼接
--- 保留策略：每会话保留最近 200 条；回复前读取最近 10 轮
+-- 销售对话历史表（短期记忆）
+--
+-- 用途：Agent 调用前按 conversation_id 加载历史消息，
+--       拼成 messages 列表传给 LLM；调用成功后成对回写
+--       user + assistant 两条消息。
+--
+-- conversation_id 取值：
+--   群聊  → 飞书 chat_id（按群隔离会话）
+--   单聊  → 飞书 open_id（按人隔离会话，fallback）
+--
+-- token_len：入库时用 len(content)//4 粗略估算，
+--            读取时按 max_tokens=4000 从新到旧累加裁剪。
+--
+-- 保留策略：每次写入后清理，单会话只保留最近 200 条。
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `chat_history` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

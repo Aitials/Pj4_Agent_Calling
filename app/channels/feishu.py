@@ -351,15 +351,20 @@ class FeishuChannel(Channel):
         if not text:
             return None
 
+        chat_id = str(message.chat_id or "")
+        # conversation_id：群聊用 chat_id，单聊 fallback 到 open_id
+        conversation_id = chat_id or user_id
+
         return IncomingMessage(
             channel=self.name,
             message_id=message_id,
             user_id=user_id,
+            conversation_id=conversation_id,
             text=text,
             media=media,
             raw=message,
             reply_handle={
-                "chat_id": str(message.chat_id or ""),
+                "chat_id": chat_id,
                 "message_id": message_id,
                 "chat_type": str(message.chat_type or ""),
                 "message_type": message_type,

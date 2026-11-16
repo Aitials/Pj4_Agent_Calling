@@ -39,7 +39,10 @@ class IncomingMessage:
     """消息唯一 ID，用于去重。"""
 
     user_id: str
-    """发送者 ID。"""
+    """发送者 ID（飞书 open_id）。"""
+
+    conversation_id: str
+    """会话标识：群聊用 chat_id，单聊 fallback 到 open_id（user_id）。"""
 
     text: str
     """待交给 Agent 的文本（媒体消息会附加本地路径说明）。"""

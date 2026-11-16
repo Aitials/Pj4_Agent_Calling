@@ -52,20 +52,50 @@ class BaseAgent:
             system_prompt=SYSTEM_PROMPT,
         )
 
-    def invoke(self, text: str) -> str:
-        """同步调用，返回最终文本结果。"""
-        result = self.agent.invoke({"messages": [{"role": "user", "content": text}]})
+    def invoke(
+        self,
+        text: str | None = None,
+        messages: list[dict] | None = None,
+    ) -> str:
+        """同步调用，返回最终文本结果。
+
+        优先使用 messages 列表（短期记忆场景）；仅传 text 时等价于单轮 user 消息。
+        """
+        payload = self._build_messages(text, messages)
+        result = self.agent.invoke({"messages": payload})
         if isinstance(result, dict) and result.get("messages"):
             return _message_text(result["messages"][-1].content)
         return str(result)
 
-    async def astream(self, text: str):
-        """流式产出文本增量，供聊天通道做打字机效果。"""
+    async def astream(
+        self,
+        text: str | None = None,
+        messages: list[dict] | None = None,
+    ):
+        """流式产出文本增量，供聊天通道做打字机效果。
+
+        优先使用 messages 列表（短期记忆场景）；仅传 text 时等价于单轮 user 消息。
+        """
+        payload = self._build_messages(text, messages)
         async for event in self.agent.astream_events(
-            {"messages": [{"role": "user", "content": text}]}, version="v2"
+            {"messages": payload}, version="v2"
         ):
             if event["event"] != "on_chat_model_stream":
                 continue
             content = event["data"]["chunk"].content
             if isinstance(content, str) and content:
                 yield content
+
+    @staticmethod
+    def _build_messages(text: str | None, messages: list[dict] | None) -> list[dict]:
+        """拼装最终传给 LangChain 的 messages 列表。
+
+        规则：messages 列表 + 末尾补本轮 user 消息（如果有 text）。
+        这样调用方可以先加载历史，再把本轮 user 消息拼在最后。
+        """
+        history = list(messages or [])
+        if text:
+            history.append({"role": "user", "content": text})
+        if not history:
+            raise ValueError("text 和 messages 不能同时为空")
+        return history
