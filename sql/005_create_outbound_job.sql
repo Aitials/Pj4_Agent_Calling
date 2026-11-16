@@ -3,7 +3,7 @@
 -- 保存我方任务与一知 AICC 任务 ID 的映射及状态
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `outbound_job` (
   `id`              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

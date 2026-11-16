@@ -4,7 +4,7 @@
 -- 幂等键：record_id（缺失时用 号码+时间+任务号 生成稳定哈希）
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `call_record` (
   `id`                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

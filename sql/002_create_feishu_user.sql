@@ -4,7 +4,7 @@
 -- 说明：部门字段为预留列，当前通讯录权限范围未覆盖部门，先留空
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `feishu_user` (
   `open_id`         VARCHAR(64)  NOT NULL                COMMENT '用户在本应用内的 open_id，主键',

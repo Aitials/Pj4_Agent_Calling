@@ -4,7 +4,7 @@
 -- 游标只在 SUCCESS / PARTIAL 时推进
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `sync_log` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

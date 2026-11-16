@@ -3,7 +3,7 @@
 -- 一条通话记录对应一条当前有效分析结果，重跑时覆盖
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `agent_analysis` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

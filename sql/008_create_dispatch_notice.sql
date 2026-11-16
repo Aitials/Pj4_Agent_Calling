@@ -3,7 +3,7 @@
 -- 按「企业 + 销售」去重，避免同一企业重复通知同一销售
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `dispatch_notice` (
   `id`                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',

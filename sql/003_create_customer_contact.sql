@@ -1,15 +1,17 @@
 -- ============================================================
 -- 企业联系人/号码从表
 -- 一个企业可有多个号码；号码全局唯一，避免同一号码挂到两家企业
+-- V1.1（2026-11-16）：新增 phone_source 号码来源字段，适配企查查"有效手机号/更多电话"导出列
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `customer_contact` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',
   `credit_code`      VARCHAR(32)     NOT NULL                COMMENT '所属企业统一社会信用代码',
   `phone`            VARCHAR(32)     NOT NULL                COMMENT '规范化电话号码，唯一',
   `phone_type`       VARCHAR(16)     NOT NULL DEFAULT 'MOBILE' COMMENT '号码类型：MOBILE手机 / LANDLINE固话',
+  `phone_source`     VARCHAR(32)     DEFAULT NULL            COMMENT '号码来源：VALID_CELL_PHONES有效手机号/MORE_PHONE更多电话/MANUAL人工补录/UNKNOWN来源不明',
   `contact_name`     VARCHAR(64)     DEFAULT NULL            COMMENT '联系人姓名，企查查数据可能为空',
   `is_primary`       TINYINT         NOT NULL DEFAULT 0      COMMENT '是否主号码：0否 1是',
   `is_blacklist`     TINYINT         NOT NULL DEFAULT 0      COMMENT '号码级黑名单：0否 1是',

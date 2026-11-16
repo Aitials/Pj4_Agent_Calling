@@ -3,7 +3,7 @@
 -- 每次导入企查查 Excel 记录一条，用于统计结果与定位错误
 -- ============================================================
 
-USE `pj5_agent_calling`;
+USE `agent_calling`;
 
 CREATE TABLE IF NOT EXISTS `import_batch` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '本地自增主键',
