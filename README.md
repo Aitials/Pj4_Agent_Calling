@@ -1,18 +1,20 @@
 # Pj4 Agent Calling — AI 外呼获客助手
 
-基于 LangChain 的 Agent 骨架，对接好客搜（whxt.jshks.com）客户管理后台，自动同步客户档案、通话记录，并通过飞书机器人对外提供查询能力。
+基于 LangChain 的 Agent 骨架，通过飞书机器人对外提供客户查询、消息推送与任务指派能力。外呼与通话数据源规划为一知 AICC（测试账号对接中），客户名单来自企查查导出。
 
 ## 功能清单
 
 | 能力 | 实现状态 | 说明 |
 |---|---|---|
-| 好客搜自动登录 + Cookie 缓存 | ✅ 完成 | ddddocr OCR 识别验证码，2 小时 TTL，过期自动重登 |
-| 客户档案全量导出 | ✅ 完成 | `@tool export_haokesou_customers`，支持分页全量拉取 |
 | 客户档案按姓名/手机号查询 | ✅ 完成 | `@tool query_customer_profile`，查本地 MySQL |
 | 飞书机器人接入 | ✅ 完成 | 长连接 + 流式卡片回复 |
-| 通话历史增量同步 | 📋 设计中 | 接口已探明，表结构已设计，待建表实现 |
-| 通话 ASR 转写 | 📋 设计中 | 依赖 `member/backdetail` 接口，待确认是否存储 |
-| 状态流转历史追踪 | 📋 设计中 | 可选表 `customer_status_history`，待决策 |
+| 飞书主动消息与任务 | ✅ 完成 | `find_feishu_member` / `send_feishu_message` / `create_feishu_task` |
+| 一知外呼任务对接 | 📋 开发中 | 线路查询、任务创建、启动、状态同步 |
+| 通话与转写回收 | 📋 待条件 | 一知测试账号暂无真实通话与转写 |
+| AI 意向分析 | 📋 设计完成 | 结构化输出意向等级、理由、原文引用 |
+| 企查查名单导入 | 📋 待模板 | 按统一社会信用代码归并企业 |
+| 销售对话短期记忆 | 📋 待开发 | 按销售维度保留最近 10 轮对话 |
+| 好客搜客户导出 | ❌ 已下线 | 2026-11-16 删除相关代码，改由一知承接 |
 
 ## 快速开始
 
@@ -31,7 +33,7 @@ copy .env.example .env
 #   sql/001_create_customer_profile.sql
 
 # 4. 终端单轮测试
-.venv\Scripts\python.exe main.py "帮我导出好客搜的客户资料"
+.venv\Scripts\python.exe main.py "查一下客户 13800001111 的档案"
 
 # 5. 启动飞书长连接
 .venv\Scripts\python.exe run_feishu.py
@@ -42,10 +44,6 @@ copy .env.example .env
 ```ini
 # ===== 模型服务（OpenAI 兼容）=====
 LLM_API_KEY=                    # 必填，默认走 glm-4.5-air
-
-# ===== 好客搜登录（自动刷新 Cookie 依赖）=====
-HAOKESOU_USERNAME=              # 必填，填了就走 OCR 自动登录
-HAOKESOU_PASSWORD=              # 必填
 
 # ===== MySQL =====
 MYSQL_PASSWORD=                 # 必填
@@ -65,70 +63,37 @@ FEISHU_APP_SECRET=
 │   ├── channels/                 # 飞书长连接通道
 │   │   ├── base.py
 │   │   └── feishu.py
-│   ├── clients/                  # 好客搜 HTTP 客户端层
-│   │   ├── haokesou.py           # 客户列表接口 + Cookie 失效兜底
-│   │   └── haokesou_auth.py      # OCR 自动登录 + Cookie JSON 缓存（7200秒）
+│   ├── clients/                  # 外部平台客户端层（一知客户端待接入）
 │   ├── core/                     # 基础层：配置加载、文本对齐工具
-│   ├── repositories/             # 数据访问层（只读查询，按 phone upsert）
+│   ├── repositories/             # 数据访问层（按 phone 查询与 upsert）
 │   │   └── customer_repo.py
 │   ├── router/                   # 消息路由（飞书 → Agent）
 │   ├── schemas/                  # Pydantic 数据模型
 │   ├── tools/                    # LangChain @tool 层（对外能力）
-│   │   ├── haokesou_customers.py #   export_haokesou_customers
-│   │   └── customer_query.py     #   query_customer_profile
-├── scripts/                      # 一次性脚本（迁移、测试、对比）
-│   ├── export_customers.py       # 客户列表导出（CLI）
+│   │   ├── customer_query.py     #   query_customer_profile
+│   │   ├── feishu_message.py     #   find_feishu_member / send_feishu_message
+│   │   └── feishu_task.py        #   create_feishu_task
+├── scripts/                      # 辅助脚本
 │   ├── db_scan.py                # 扫业务库看有啥表
-│   ├── seed_test_customers.py    # 造测试数据（按 phone upsert）
-│   └── compare_schema.py         # DB vs 好客搜接口字段对比
+│   ├── seed_test_customers.py    # 造测试数据
+│   ├── sync_feishu_users.py      # 同步飞书成员
+│   └── feishu_api_check.py       # 飞书接口连通性检查
 ├── sql/                          # 建表 SQL
 │   └── 001_create_customer_profile.sql
 ├── state/                        # 运行时状态（gitignore）
-│   └── .haokesou_cookie          # Cookie JSON 缓存
-├── 客户档案表设计.md              # 主表字段说明
-├── 从表与增量同步设计.md          # 通话历史表 + 同步方案
-├── 接口说明.md                    # 好客搜接口清单（带验证状态标记）
-├── 外呼需求.md                    # 原始需求文档
-├── .env.example                   # 配置模板
-├── main.py                        # 终端单轮入口
-├── run_feishu.py                  # 飞书长连接入口
+├── main.py                       # 终端单轮入口
+├── run_feishu.py                 # 飞书长连接入口
 └── requirements.txt
 ```
-
-## 好客搜接口已验证清单
-
-| 接口 | 状态 | 备注 |
-|---|---|---|
-| `POST /user/Member/ajax_intentional_member` | ✅ 已实装 | 客户列表（支持分页、手机号/姓名/任务/时间/意愿等级筛选） |
-| `POST /user/index/login` | ✅ 已实装 | OCR 自动登录（ddddocr） |
-| `GET /user/index/verify` | ✅ 已实装 | 验证码图片 |
-| `POST /user/callrecord/get_new_call_historical_record` | 📋 已探明 | 历史通话记录（按日分表，支持 `start_call_time` 增量） |
-| `POST /user/member/backdetail` | 📋 已探明 | 通话详情 + ASR 转写 + 录音 URL |
-| `POST /user/Plan/ajax_task_statistics` | 📋 已探明 | 任务统计 |
-
-## Cookie 机制
-
-```
-ensure_cookie()
-  │
-  ├─ 环境变量 HAOKESOU_COOKIE 存在？ ──是──▶ 直接返回（忽略过期）
-  │
-  ├─ 缓存文件 expires_at > now？ ──是──▶ 直接返回（0 开销）
-  │
-  └─ 走 OCR 登录刷新一次（POST /user/index/login）
-     └─ 覆写 state/.haokesou_cookie 为 JSON {cookie, expires_at}
-```
-
-TTL 默认 7200 秒（2 小时），改 `COOKIE_TTL_SEC` 一行即可调整。
-
-接口请求层额外兜底：好客搜返回非 JSON（Cookie 失效）→ 强制重登一次 → 重试原请求。
 
 ## Agent 工具
 
 | 工具名 | 入参 | 返回 |
 |---|---|---|
-| `export_haokesou_customers` | `limit=50, max_pages=200` | 终端表格文本（对齐打印） |
 | `query_customer_profile` | `keyword, limit=10` | 手机号精确 / 姓名模糊，1 条出详情、多条出摘要表、0 条给提示 |
+| `find_feishu_member` | `name` | 按姓名匹配飞书成员，返回 open_id |
+| `send_feishu_message` | `open_id, content` | 主动发送文本或卡片消息 |
+| `create_feishu_task` | `open_id, summary, ...` | 创建并指派飞书任务 |
 
 ## 技术栈
 
@@ -136,20 +101,32 @@ TTL 默认 7200 秒（2 小时），改 `COOKIE_TTL_SEC` 一行即可调整。
 |---|---|---|
 | Python | 3.14 | venv |
 | LangChain | 1.5.0 | create_agent + LCEL |
-| httpx | — | HTTP 客户端（Cookie 登录、好客搜接口） |
 | pymysql | — | MySQL 驱动 |
-| ddddocr | — | 验证码 OCR（show_ad=False） |
 | lark-oapi | 1.7.5 | 飞书长连接 |
+
+## 文档索引
+
+设计与接口文档统一放在 `AI messages/`：
+
+| 文档 | 内容 |
+|---|---|
+| `外呼需求.md` | 原始需求 |
+| `接口说明.md` | 好客搜接口清单与实现方法（已归档，代码已删除） |
+| `一知智能AICC接口文档.md` | 一知接口实测清单 |
+| `业务表结构说明.md` | 业务表结构与一知增量同步设计 |
+| `开发计划书_一周版.md` | 一周开发计划 |
 
 ## 安全约定
 
 - `.env`、`state/`、`.idea/` 均已 `.gitignore`
-- 好客搜账号密码写 `.env`，不提交仓库
-- Cookie 文件是 JSON，`state/` 已忽略
+- 数据库密码、飞书密钥只写 `.env`，不提交仓库
 
 ## 下一步（待做）
 
-1. 执行 ALTER TABLE 补主表缺失列（`source_status` / `source_member_id` / `is_look`）
-2. 建通话历史表 `call_record`（唯一键 `record_id`，增量拉取）
-3. 写通话历史同步脚本（先拉列表再补转写 / 按需调 `backdetail`）
-4. 字段映射规范化（`compay_name → company_name`、`sex 字符串→TINYINT`、`Unix秒→DATETIME`）
+1. D1：建业务表（`credit_code` 为企业主键）+ 销售对话短期记忆
+2. D2：打通一知任务创建、启动与状态查询
+3. D3：飞书通知销售（先用供应商意向标签触发）
+4. D4：AI 分析接管通知规则
+5. D5：通话与转写回收（待真实通话产出后回归）
+6. D6：企查查名单导入与清洗
+7. D7：联调与演示

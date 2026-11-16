@@ -4,9 +4,21 @@ from __future__ import annotations
 
 from langchain_core.tools import tool
 
-from app.clients.haokesou import CRM_CATE, LEVEL
 from app.core.textfmt import display_width, pad
 from app.repositories.customer_repo import DatabaseError, search_customers
+
+# 展示用字典（好客搜客户端已下线，本地保留，避免工具层依赖已删除模块）
+CRM_CATE = {
+    0: "未分类",
+    1: "意向客户",
+    2: "沟通中",
+    3: "试用中",
+    4: "已成交",
+    5: "无意向",
+    6: "再跟踪",
+    7: "未接",
+}
+LEVEL = {1: "A", 2: "B", 3: "C", 4: "D", 5: "E", 6: "F"}
 
 SUMMARY_COLUMNS = [
     ("序号", 4),

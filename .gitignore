@@ -7,6 +7,4 @@ __pycache__/
 .idea/workspace.xml
 state/
 
-# ===== 设计文档（暂不公开）=====
-*.md
-!README.md
+AI messages
