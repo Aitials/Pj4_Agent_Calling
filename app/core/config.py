@@ -35,6 +35,11 @@ FEISHU_APP_ID = get_env("FEISHU_APP_ID").strip()
 FEISHU_APP_SECRET = get_env("FEISHU_APP_SECRET").strip()
 FEISHU_MEDIA_DIR = _path_from_env("FEISHU_MEDIA_DIR", STATE_DIR / "feishu_media")
 
+# 群聊默认关闭：只处理单聊（p2p）消息，记忆 thread_id 收敛到 open_id
+ALLOW_GROUP_CHAT = get_env("ALLOW_GROUP_CHAT", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 
 @dataclass(frozen=True)
 class Settings:

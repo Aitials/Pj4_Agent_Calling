@@ -7,9 +7,11 @@
     4. 归并：企业按 credit_code upsert；号码按 phone upsert，冲突归 conflict_count
     5. 写入 import_batch 并更新统计；向终端打印完整结果
 
-用法：
+用法（直接运行后按提示粘贴 Excel 路径，支持把文件拖进终端）：
+    .venv\\Scripts\\python.exe sql\\012_import_qichacha.py
+    .venv\\Scripts\\python.exe sql\\012_import_qichacha.py --operator 壕z --dry-run
+    # 也兼容命令行直接带路径
     .venv\\Scripts\\python.exe sql\\012_import_qichacha.py "AI messages\\企业工商信息测试表.xlsx"
-    .venv\\Scripts\\python.exe sql\\012_import_qichacha.py "path.xlsx" --operator 壕z
 """
 
 from __future__ import annotations
@@ -267,18 +269,53 @@ def build_profile_values(row: dict, batch_no: str, raw_json: str) -> tuple | Non
     )
 
 
+def _to_path(raw: str) -> Path:
+    """把用户输入（可能带引号 / 反斜杠转义）转成绝对路径。"""
+    s = raw.strip().strip("\"'").strip()
+    # 终端里拖拽文件常出现 \\?\ 长路径前缀，去掉后 Path 处理更稳
+    if s.startswith("\\\\?\\"):
+        s = s[4:]
+    path = Path(s)
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def prompt_excel_path() -> Path | None:
+    """交互式读取 Excel 路径，直到拿到存在的文件；输入 q 退出。"""
+    print("请粘贴企查查导出的 Excel 完整路径（可把文件直接拖进终端，输入 q 退出）：")
+    while True:
+        raw = input("Excel 路径> ").strip()
+        if raw.lower() in ("q", "quit", "exit"):
+            return None
+        if not raw.strip("\"'").strip():
+            print("路径不能为空，请重新输入。")
+            continue
+        path = _to_path(raw)
+        if not path.exists():
+            print(f"[错误] 文件不存在：{path}")
+            continue
+        if path.suffix.lower() not in (".xlsx", ".xlsm"):
+            print(f"[警告] 文件后缀为 {path.suffix}，仍尝试按 Excel 读取")
+        return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="企查查 Excel 清洗入库")
-    parser.add_argument("excel", help="Excel 文件路径")
+    parser.add_argument("excel", nargs="?", help="Excel 文件路径（不填则运行时交互输入）")
     parser.add_argument("--operator", default="壕z", help="导入操作人")
     parser.add_argument("--dry-run", action="store_true", help="只解析打印，不写数据库")
     args = parser.parse_args()
 
-    xlsx_path = Path(args.excel)
-    if not xlsx_path.is_absolute():
-        xlsx_path = (PROJECT_ROOT / xlsx_path).resolve()
-    if not xlsx_path.exists():
-        print(f"[错误] 文件不存在：{xlsx_path}")
+    if args.excel:
+        xlsx_path = _to_path(args.excel)
+        if not xlsx_path.exists():
+            print(f"[错误] 文件不存在：{xlsx_path}")
+            print("下面改为交互式输入：")
+            xlsx_path = prompt_excel_path()
+    else:
+        xlsx_path = prompt_excel_path()
+
+    if xlsx_path is None:
+        print("已取消导入。")
         return 1
 
     batch_no = gen_batch_no()

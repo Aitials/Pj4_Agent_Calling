@@ -43,7 +43,12 @@ from lark_oapi.api.im.v1 import (
 )
 
 from app.channels.base import Channel, IncomingMessage, MediaAttachment, MessageHandler
-from app.core.config import FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_MEDIA_DIR
+from app.core.config import (
+    ALLOW_GROUP_CHAT,
+    FEISHU_APP_ID,
+    FEISHU_APP_SECRET,
+    FEISHU_MEDIA_DIR,
+)
 
 log = logging.getLogger("feishu")
 
@@ -294,6 +299,14 @@ class FeishuChannel(Channel):
         if not user_id:
             return None
 
+        chat_type = str(message.chat_type or "")
+        if chat_type and chat_type != "p2p" and not ALLOW_GROUP_CHAT:
+            log.info(
+                "群聊已关闭，忽略消息 chat_id=%s chat_type=%s",
+                message.chat_id, chat_type,
+            )
+            return None
+
         try:
             content = json.loads(message.content or "{}")
         except json.JSONDecodeError:
@@ -352,8 +365,8 @@ class FeishuChannel(Channel):
             return None
 
         chat_id = str(message.chat_id or "")
-        # conversation_id：群聊用 chat_id，单聊 fallback 到 open_id
-        conversation_id = chat_id or user_id
+        # 群聊已关闭：记忆统一按发送人隔离，thread_id = open_id
+        conversation_id = user_id
 
         return IncomingMessage(
             channel=self.name,
@@ -366,7 +379,7 @@ class FeishuChannel(Channel):
             reply_handle={
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "chat_type": str(message.chat_type or ""),
+                "chat_type": chat_type,
                 "message_type": message_type,
             },
         )
@@ -448,9 +461,9 @@ class FeishuChannel(Channel):
                     if not await self._update_card(card_id, answer, sequence):
                         card_id = None
                     last_push = now
-        except Exception as exc:
+        except Exception:
             log.exception("飞书流式回复失败")
-            answer = answer or f"抱歉，处理失败了：{exc}"
+            answer = answer or "抱歉，处理失败了，请稍后再试。"
 
         if card_id:
             sequence += 1

@@ -2,13 +2,13 @@
 
 执行内容：
     1. 自动创建业务库（库名取 .env 的 MYSQL_DATABASE，默认 agent_calling，utf8mb4）
-    2. 依序执行 sql/001~010 建表脚本，每张表建好后终端输出提示
-    3. 插入 3 家企业完整链路测试数据（企业 → 联系人 → 外呼 → 通话 → AI 分析 → 通知 → 对话 → 同步）
+    2. 依序执行 sql/ 下的建表脚本（001~008、010），每张表建好后终端输出提示
+    3. 插入 3 家企业完整链路测试数据（企业 → 联系人 → 外呼 → 通话 → AI 分析 → 通知 → 同步）
     4. 可重复执行：建表用 IF NOT EXISTS（已存在则跳过），测试数据按唯一键 upsert
 
 用法：
-    .venv\\Scripts\\python.exe sql\\011_init_db.py             # 建表 + 插测试数据
-    .venv\\Scripts\\python.exe sql\\011_init_db.py --recreate  # 先删旧表再重建（旧数据不保留）
+    .venv\\Scripts\\python.exe sql\\000_init_db.py             # 建表 + 插测试数据
+    .venv\\Scripts\\python.exe sql\\000_init_db.py --recreate  # 先删旧表再重建（旧数据不保留）
 """
 
 from __future__ import annotations
@@ -198,20 +198,6 @@ ON DUPLICATE KEY UPDATE
   `feishu_task_guid` = VALUES(`feishu_task_guid`),
   `status` = VALUES(`status`),
   `sent_at` = VALUES(`sent_at`);
-"""),
-    ("chat_history", "销售对话 3 条（同一会话，短期记忆测试）", r"""
-INSERT INTO `chat_history`
-  (`id`, `conversation_id`, `open_id`, `role`, `content`, `token_len`, `created_at`)
-VALUES
-  (1, 'ou_290272b2dcd7d52a1cdba52c79cc29d7', 'ou_290272b2dcd7d52a1cdba52c79cc29d7',
-   'user', '杭州云启这个客户什么情况？', 12, '2026-11-16 10:40:00'),
-  (2, 'ou_290272b2dcd7d52a1cdba52c79cc29d7', 'ou_290272b2dcd7d52a1cdba52c79cc29d7',
-   'assistant', '杭州云启信息技术有限公司，高意向。客户说销售团队现在手动打电话效率太低，主动问了收费，并约你明天下午三点后回电详聊。建议先发方案和报价。', 68, '2026-11-16 10:40:05'),
-  (3, 'ou_290272b2dcd7d52a1cdba52c79cc29d7', 'ou_290272b2dcd7d52a1cdba52c79cc29d7',
-   'user', '那明天记得提醒我', 9, '2026-11-16 10:41:00')
-ON DUPLICATE KEY UPDATE
-  `content` = VALUES(`content`),
-  `created_at` = VALUES(`created_at`);
 """),
     ("sync_log", "同步日志 1 条", r"""
 INSERT INTO `sync_log`

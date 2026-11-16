@@ -14,8 +14,8 @@ import logging
 # "This event loop is already running"，导致长连接直接断开。
 import lark_oapi.ws  # noqa: F401
 
-from app.core.config import FEISHU_APP_ID, FEISHU_APP_SECRET
-from app.router import get_agent, run_channel, setup_logging
+from app.core.config import FEISHU_APP_ID, FEISHU_APP_SECRET, Settings, get_env
+from app.router import run_channel, setup_logging
 
 log = logging.getLogger("run")
 
@@ -26,15 +26,18 @@ def main() -> None:
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
         raise SystemExit("缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请先在 .env 中配置")
 
-    # 提前校验模型配置，避免长连接建立后才发现缺少 API Key
+    # 提前校验模型与记忆库配置，避免长连接建立后才发现缺配置
     try:
-        get_agent()
+        Settings.load()
     except RuntimeError as exc:
         raise SystemExit(f"[配置错误] {exc}") from exc
+    if not get_env("PG_PASSWORD"):
+        raise SystemExit("缺少 PG_PASSWORD，请在 .env 中配置 PostgreSQL 连接信息")
 
     log.info("启动通道：feishu")
     try:
-        asyncio.run(run_channel("feishu"))
+        # psycopg 异步连接池不支持 Windows 默认的 ProactorEventLoop
+        asyncio.run(run_channel("feishu"), loop_factory=asyncio.SelectorEventLoop)
     except KeyboardInterrupt:
         pass
 

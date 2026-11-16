@@ -42,7 +42,7 @@ class IncomingMessage:
     """发送者 ID（飞书 open_id）。"""
 
     conversation_id: str
-    """会话标识：群聊用 chat_id，单聊 fallback 到 open_id（user_id）。"""
+    """会话标识：当前仅支持单聊，取发送人 open_id（群聊已关闭）。"""
 
     text: str
     """待交给 Agent 的文本（媒体消息会附加本地路径说明）。"""
