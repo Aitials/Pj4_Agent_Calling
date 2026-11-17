@@ -12,7 +12,7 @@ import logging
 from app.cards import aicc_task_cards as cards
 from app.clients import aicc_options
 from app.core import forms
-from app.tools import aicc_task
+from app.tools import aicc_task, aicc_task_status
 
 log = logging.getLogger("aicc_flow")
 
@@ -72,6 +72,183 @@ async def open_start_form(channel, chat_id: str, operator: str, message_id: str 
     await channel.send_card_to_chat(chat_id, card)
 
 
+def _filters_text(filters: dict) -> str:
+    status_map = dict(cards.STATUS_FILTER_OPTIONS)
+    order_map = dict(cards.ORDER_TYPE_OPTIONS)
+    status = status_map.get(str(filters.get("status") or "ALL"), "全部")
+    order = order_map.get(str(filters.get("order_type") or "CREATE_TIME"), "-")
+    return f"筛选：{status} · {order} · 近 {filters.get('days', 15)} 天"
+
+
+def _parse_status_filters(form_value: dict) -> dict:
+    status = str(form_value.get("status_filter") or "ALL")
+    if status not in dict(cards.STATUS_FILTER_OPTIONS):
+        status = "ALL"
+    order = str(form_value.get("order_type") or "CREATE_TIME")
+    if order not in dict(cards.ORDER_TYPE_OPTIONS):
+        order = "CREATE_TIME"
+    raw_days = str(form_value.get("days") or "15").strip()
+    days = int(raw_days) if raw_days.isdigit() else 15
+    if days not in (7, 15, 30):
+        days = 15
+    return {"status": status, "order_type": order, "days": days}
+
+
+async def open_status_form(
+    channel,
+    chat_id: str,
+    operator: str,
+    message_id: str = "",
+    keyword: str = "",
+) -> None:
+    """任务状态查询入口：有关键词先匹配，否则直接给筛选卡。"""
+    filters = {"status": "ALL", "order_type": "CREATE_TIME", "days": 15}
+    token = forms.register(
+        kind="status",
+        step="filter",
+        operator=operator,
+        chat_id=chat_id,
+        message_id=message_id,
+        data={"filters": filters},
+    )
+    keyword = (keyword or "").strip()
+    if not keyword:
+        await channel.send_card_to_chat(chat_id, cards.build_status_filter(token=token))
+        return
+
+    try:
+        matches = await asyncio.to_thread(aicc_task_status.find_jobs_by_keyword, keyword)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("按关键词匹配任务失败：%s", exc)
+        await channel.send_card_to_chat(
+            chat_id, cards.build_status_filter(token=token, error=f"查询任务失败：{exc}")
+        )
+        return
+
+    if len(matches) == 1:
+        await _send_status_overview(channel, chat_id, token, matches[0]["id"], filters)
+        return
+    if matches:
+        forms.update(
+            token,
+            step="list",
+            data={"filters": filters, "jobs": matches, "page": 1, "keyword": keyword},
+        )
+        await channel.send_card_to_chat(
+            chat_id,
+            cards.build_status_list(
+                token=token,
+                jobs=matches,
+                page=1,
+                filters_text=f"{_filters_text(filters)}\n匹配关键词：{keyword}",
+            ),
+        )
+        return
+    await channel.send_card_to_chat(
+        chat_id, cards.build_status_filter(token=token, error=f"未找到包含「{keyword}」的任务")
+    )
+
+
+async def _send_status_overview(
+    channel,
+    chat_id: str,
+    token: str,
+    job_id: int,
+    filters: dict,
+    force: bool = False,
+) -> None:
+    try:
+        overview = await asyncio.to_thread(aicc_task_status.build_overview, job_id, force)
+    except Exception as exc:  # noqa: BLE001
+        await channel.send_text_to_chat(chat_id, f"读取任务 {job_id} 的运行概况失败：{exc}")
+        return
+    record, _reason = forms.get_for(token)
+    data = dict((record or {}).get("data") or {})
+    data.update({"job_id": int(job_id), "filters": filters})
+    forms.update(token, step="detail", data=data)
+    await channel.send_card_to_chat(
+        chat_id, cards.build_status_overview(token=token, overview=overview)
+    )
+
+
+async def _status_query(channel, token: str, form_value: dict, operator: str, chat_id: str) -> None:
+    record = _require_record(token, operator, "status")
+    if not record:
+        await channel.send_text_to_chat(chat_id, "这张卡片已过期或已提交，请重新发起任务状态查询。")
+        return
+    filters = _parse_status_filters(form_value)
+    try:
+        jobs = await asyncio.to_thread(
+            aicc_task_status.query_jobs,
+            status=filters["status"],
+            order_type=filters["order_type"],
+            days=filters["days"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        await channel.send_card_to_chat(
+            chat_id, cards.build_status_filter(token=token, error=f"查询任务失败：{exc}")
+        )
+        return
+
+    if not jobs:
+        await channel.send_card_to_chat(
+            chat_id,
+            cards.build_status_filter(
+                token=token, error=f"{_filters_text(filters)}：没有符合条件的任务"
+            ),
+        )
+        return
+
+    forms.update(token, step="list", data={"filters": filters, "jobs": jobs, "page": 1})
+    await channel.send_card_to_chat(
+        chat_id,
+        cards.build_status_list(
+            token=token, jobs=jobs, page=1, filters_text=_filters_text(filters)
+        ),
+    )
+
+
+async def _status_page(channel, token: str, value: dict, operator: str, chat_id: str) -> None:
+    record = _require_record(token, operator, "status")
+    if not record or record.get("step") != "list":
+        await channel.send_text_to_chat(chat_id, "任务列表已过期，请重新筛选。")
+        return
+    jobs = record.get("data", {}).get("jobs") or []
+    filters = record.get("data", {}).get("filters") or {}
+    page = str(value.get("page") or "1")
+    page = int(page) if page.isdigit() else 1
+    data = dict(record.get("data") or {})
+    data["page"] = page
+    forms.update(token, data=data)
+    await channel.send_card_to_chat(
+        chat_id,
+        cards.build_status_list(
+            token=token, jobs=jobs, page=page, filters_text=_filters_text(filters)
+        ),
+    )
+
+
+async def _status_back(channel, token: str, value: dict, operator: str, chat_id: str) -> None:
+    record = _require_record(token, operator, "status")
+    if not record:
+        await channel.send_text_to_chat(chat_id, "这张卡片已过期，请重新发起任务状态查询。")
+        return
+    target = str(value.get("to") or "list")
+    data = record.get("data") or {}
+    jobs = data.get("jobs") or []
+    if target == "filter" or not jobs:
+        await channel.send_card_to_chat(chat_id, cards.build_status_filter(token=token))
+        return
+    filters = data.get("filters") or {}
+    page = data.get("page") or 1
+    await channel.send_card_to_chat(
+        chat_id,
+        cards.build_status_list(
+            token=token, jobs=jobs, page=page, filters_text=_filters_text(filters)
+        ),
+    )
+
+
 async def handle_action(
     channel,
     action: str,
@@ -103,6 +280,47 @@ async def handle_action(
                 await open_start_form(channel, chat_id, operator, message_id)
             else:
                 await open_create_form(channel, chat_id, operator, message_id)
+            return
+
+        if action in ("debug_open_status", "open_status"):
+            await open_status_form(
+                channel,
+                chat_id,
+                operator,
+                message_id,
+                str(value.get("task_keyword") or ""),
+            )
+            return
+        if action == "task_status_filter":
+            await open_status_form(channel, chat_id, operator, message_id)
+            return
+        if action == "task_status_query":
+            await _status_query(channel, token, form_value, operator, chat_id)
+            return
+        if action == "task_status_page":
+            await _status_page(channel, token, value, operator, chat_id)
+            return
+        if action in ("task_status_pick", "task_status_refresh"):
+            record = _require_record(token, operator, "status")
+            if not record:
+                await channel.send_text_to_chat(chat_id, "这张卡片已过期，请重新发起任务状态查询。")
+                return
+            raw_job_id = str(value.get("job_id") or "")
+            if not raw_job_id.isdigit():
+                await channel.send_text_to_chat(chat_id, "任务 ID 无效，请重新选择任务。")
+                return
+            filters = record.get("data", {}).get("filters") or {}
+            await _send_status_overview(
+                channel,
+                chat_id,
+                token,
+                int(raw_job_id),
+                filters,
+                force=action == "task_status_refresh",
+            )
+            return
+        if action == "task_status_back":
+            await _status_back(channel, token, value, operator, chat_id)
             return
 
         if action == "task_create_step1":

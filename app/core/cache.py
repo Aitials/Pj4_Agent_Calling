@@ -26,6 +26,8 @@ REDIS_TIMEOUT = float(get_env("REDIS_TIMEOUT", "2").strip() or 2)
 
 # 看板类数据默认缓存 10 分钟
 DASHBOARD_TTL = int(get_env("AICC_DASHBOARD_TTL", "600").strip() or 600)
+# 任务状态需要接近实时，默认 60 秒
+TASK_STATUS_TTL = int(get_env("AICC_TASK_STATUS_TTL", "60").strip() or 60)
 
 _client: redis.Redis | None = None
 _redis_down = False
@@ -64,6 +66,16 @@ def get(key: str) -> str | None:
     except redis.RedisError as exc:
         _warn_once(exc)
         return None
+
+
+def delete(key: str) -> None:
+    """主动失效单个键（用于「刷新数据」时跳过缓存）。"""
+    if _redis_down:
+        return
+    try:
+        get_client().delete(key)
+    except redis.RedisError as exc:
+        _warn_once(exc)
 
 
 def set(key: str, value: str, ttl: int = DASHBOARD_TTL) -> None:

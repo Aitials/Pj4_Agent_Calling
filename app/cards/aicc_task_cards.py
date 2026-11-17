@@ -101,12 +101,19 @@ def _submit_button(label: str, action: str, value: dict | None = None) -> dict:
     }
 
 
-def _callback_button(label: str, action: str, value: dict | None = None, type_: str = "default") -> dict:
+def _callback_button(
+    label: str,
+    action: str,
+    value: dict | None = None,
+    type_: str = "default",
+    name: str = "",
+) -> dict:
+    # 飞书要求同一张卡内元素 name 唯一；同一 action 出现多次时必须由调用方传不同的 name
     payload = {"action": action}
     payload.update(value or {})
     return {
         "tag": "button",
-        "name": action,
+        "name": name or action,
         "text": _text(label),
         "type": type_,
         "width": "fill",
@@ -363,3 +370,244 @@ def build_result(title: str, content: str, ok: bool = True) -> dict:
 
 def build_processing(text: str = "正在处理，请稍候…") -> dict:
     return _base_card("处理中", [_markdown(text)], template="grey")
+
+
+# ---------------------------------------------------------------------------
+# 任务运行概况：筛选 → 任务列表 → 概况
+# ---------------------------------------------------------------------------
+
+STATUS_FILTER_OPTIONS = [
+    ("ALL", "全部（不含已归档）"),
+    ("NOT_STARTED", "未开始"),
+    ("RUNNING", "进行中 / 排队"),
+    ("PAUSED", "已暂停 / 系统暂停"),
+    ("COMPLETED", "已完成"),
+    ("TERMINATE", "已终止"),
+]
+
+ORDER_TYPE_OPTIONS = [
+    ("CREATE_TIME", "按创建时间排序"),
+    ("LAST_EDIT_TIME", "按最近更新排序"),
+    ("DRAG_SORT", "按拖拽排序"),
+]
+
+DAYS_OPTIONS = [
+    ("7", "近 7 天"),
+    ("15", "近 15 天（默认）"),
+    ("30", "近 30 天"),
+]
+
+
+def build_status_filter(*, token: str, error: str = "") -> dict:
+    """任务状态查询入口：只做筛选，不输入关键词。"""
+    elements: list[dict] = []
+    if error:
+        elements.append(_error_line(error))
+    elements.append(
+        _markdown(
+            "选择筛选条件后，会列出符合条件的外呼任务；点任务上的「查看概况」看运行数据。\n"
+            "已归档任务默认不展示。"
+        )
+    )
+
+    form_elements = [
+        _select(
+            "status_filter",
+            "任务状态",
+            [_option(label, value) for value, label in STATUS_FILTER_OPTIONS],
+            placeholder="默认全部",
+        ),
+        _select(
+            "order_type",
+            "排序方式",
+            [_option(label, value) for value, label in ORDER_TYPE_OPTIONS],
+            placeholder="默认按创建时间",
+        ),
+        _select(
+            "days",
+            "创建时间范围",
+            [_option(label, value) for value, label in DAYS_OPTIONS],
+            placeholder="默认近 15 天",
+        ),
+        _submit_button("查询任务", "task_status_query", {"token": token}),
+    ]
+    elements.append(
+        {
+            "tag": "form",
+            "name": "task_status_filter",
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": form_elements,
+        }
+    )
+    elements.append(_columns(_callback_button("取消", "task_form_cancel", {"token": token})))
+    return _base_card("任务运行概况 · 选择筛选条件", elements)
+
+
+def _job_row(token: str, job: dict) -> dict:
+    lines = [
+        f"**{job.get('name') or '-'}**（{job.get('status_label') or job.get('status') or '-'}）",
+        f"创建于 {job.get('create_time') or '-'} · ID {job.get('id')}",
+    ]
+    if job.get("dialog_flow_name"):
+        lines.append(f"话术：{job['dialog_flow_name']}")
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 3,
+                "elements": [_markdown("\n".join(lines))],
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    _callback_button(
+                        "查看概况",
+                        "task_status_pick",
+                        {"token": token, "job_id": job.get("id")},
+                        name=f"task_status_pick_{job.get('id')}",
+                    )
+                ],
+            },
+        ],
+    }
+
+
+def build_status_list(
+    *,
+    token: str,
+    jobs: list[dict],
+    page: int,
+    page_size: int = 10,
+    filters_text: str = "",
+) -> dict:
+    """任务列表卡：每页 10 条，点单个任务进入概况。"""
+    total = len(jobs or [])
+    pages = max((total + page_size - 1) // page_size, 1)
+    page = min(max(page, 1), pages)
+    start = (page - 1) * page_size
+    rows = (jobs or [])[start:start + page_size]
+
+    elements: list[dict] = []
+    if filters_text:
+        elements.append(_markdown(filters_text))
+    elements.append(_markdown(f"共 **{total}** 个任务，第 {page} / {pages} 页"))
+    for job in rows:
+        elements.append(_job_row(token, job))
+
+    if pages > 1:
+        elements.append(
+            _columns(
+                _callback_button(
+                    "上一页", "task_status_page", {"token": token, "page": page - 1},
+                    name="task_status_page_prev",
+                ),
+                _callback_button(
+                    "下一页", "task_status_page", {"token": token, "page": page + 1},
+                    name="task_status_page_next",
+                ),
+            )
+        )
+    elements.append(
+        _columns(
+            _callback_button("重新筛选", "task_status_filter", {"token": token}),
+            _callback_button("取消", "task_form_cancel", {"token": token}),
+        )
+    )
+    return _base_card("任务运行概况 · 选择任务", elements)
+
+
+def _overview_template(overview: dict) -> str:
+    status = str(overview.get("status") or "")
+    if overview.get("ended"):
+        return "grey"
+    if status in ("USER_PAUSE", "SYSTEM_SUSPENDED", "MAINTAIN", "WAITING_FOR_REDIAL"):
+        return "orange"
+    if status in ("IN_PROCESS", "RUNNABLE", "IN_QUEUE"):
+        return "green"
+    return "blue"
+
+
+def build_status_overview(*, token: str, overview: dict) -> dict:
+    """运行概况卡：状态与进度 / 通话效果 / 意向分布 / 配置与提示。"""
+    progress = overview.get("progress") or {}
+    call = overview.get("call") or {}
+    config = overview.get("config") or {}
+    hints = overview.get("hints") or []
+
+    state_line = f"**状态：{overview.get('status_label')}（{overview.get('status')}）**"
+    if overview.get("ended"):
+        state_line += " · 已结束"
+
+    elements: list[dict] = [_markdown(state_line)]
+
+    progress_lines = [
+        "**状态与进度**",
+        f"- 客户进度：{progress.get('completed', 0)} / {progress.get('total', 0)}"
+        f"（{progress.get('percent', 0):.1f}%）",
+        f"- 已过滤：{progress.get('filtered', 0)} 个",
+    ]
+    if config.get("next_start"):
+        progress_lines.append(f"- 下次启动：{config['next_start']}")
+    progress_lines.append(f"- 最近外呼：{call.get('last_call_date') or '-'}")
+    elements.append(_markdown("\n".join(progress_lines)))
+
+    call_lines = [
+        "**通话效果**",
+        f"- 呼叫量：{call.get('total', 0)} 通",
+        f"- 接通量：{call.get('answered', 0)} 通，接通率 {call.get('rate', 0):.2f}%",
+        f"- 平均通话时长：{call.get('avg_duration', 0):.0f} 秒",
+        f"- 客户挂断率：{call.get('hangup_rate', 0):.2f}% · A/B 类占比：{call.get('ab_ratio', 0):.2f}%",
+    ]
+    elements.append(_markdown("\n".join(call_lines)))
+
+    intents = overview.get("intents") or []
+    intent_lines = ["**意向分布**"]
+    if intents:
+        intent_lines.extend(
+            f"- {item.get('name')}：{item.get('count')} 个（{item.get('share', 0):.1f}%）"
+            for item in intents
+        )
+    else:
+        intent_lines.append("- 暂无已分类意向")
+    elements.append(_markdown("\n".join(intent_lines)))
+
+    config_lines = [
+        "**配置摘要**",
+        f"- 话术：{config.get('dialog_flow') or '-'}",
+        f"- 线路：{config.get('lines') or '-'}",
+        f"- 并发 / BOT：{config.get('concurrency', 0)} / {config.get('robot_count', 0)}",
+        f"- 拨打时段：{config.get('daily') or '-'}（{config.get('days') or '-'}）",
+        f"- 优先级：{config.get('priority', 0)} · 创建人：{config.get('created_by') or '-'}",
+    ]
+    elements.append(_markdown("\n".join(config_lines)))
+
+    if hints:
+        elements.append(_markdown("**异常提示**\n" + "\n".join(f"- {item}" for item in hints)))
+    elements.append(
+        _markdown(
+            f"数据时间 {overview.get('fetched_at') or '-'}（缓存不超过 60 秒）"
+        )
+    )
+
+    elements.append(
+        _columns(
+            _callback_button(
+                "刷新数据", "task_status_refresh", {"token": token, "job_id": overview.get("job_id")}
+            ),
+            _callback_button("返回列表", "task_status_back", {"token": token, "to": "list"}),
+        )
+    )
+    elements.append(
+        _columns(
+            _callback_button("重新筛选", "task_status_filter", {"token": token}),
+            _callback_button("关闭", "task_form_cancel", {"token": token}),
+        )
+    )
+    return _base_card(f"{overview.get('name') or '-'} · 运行概况", elements, template=_overview_template(overview))

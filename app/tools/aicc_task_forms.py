@@ -17,6 +17,9 @@ log = logging.getLogger("aicc_task_forms")
 _CREATE_VERBS = ("创建", "新建", "建一个", "建个", "加一个", "加个", "搭建", "做个")
 _START_VERBS = ("启动", "开始跑", "开始任务", "开跑", "跑起来", "执行任务")
 _TASK_NOUNS = ("任务", "外呼", "机器人", "BOT", "bot", "话术")
+_STATUS_WORDS = (
+    "状态", "进度", "概况", "情况", "怎么样", "跑得", "进展", "完成多少", "运行", "跑到",
+)
 
 
 def _has_intent(text: str, kind: str) -> bool:
@@ -87,3 +90,64 @@ def open_start_task_form() -> str:
     不要自己猜测任务 ID，也不要直接调用启动接口。
     """
     return _open("start")
+
+
+def _has_status_intent(text: str) -> bool:
+    text = (text or "").strip()
+    if not text:
+        return False
+    if any(word in text for word in _STATUS_WORDS):
+        return True
+    return "任务" in text and any(word in text for word in ("查", "看", "多少", "如何"))
+
+
+def _open_status(task_keyword: str) -> str:
+    from app.channels.feishu import get_active_channel, get_current_message
+    from app.flows import aicc_task_flow
+
+    channel = get_active_channel()
+    message = get_current_message()
+    if channel is None or message is None:
+        return "当前不在飞书会话中，无法发送任务状态卡片。"
+
+    if not _has_status_intent(message.text):
+        return (
+            "用户当前这句话没有明确查询任务状态的意图，已取消发卡。"
+            "请先向用户确认是否要查看某个外呼任务的运行情况。"
+        )
+
+    loop = getattr(channel, "_loop", None)
+    if loop is None:
+        return "飞书通道尚未就绪，请稍后重试。"
+
+    asyncio.run_coroutine_threadsafe(
+        aicc_task_flow.handle_action(
+            channel,
+            "open_status",
+            {"task_keyword": (task_keyword or "").strip()},
+            {},
+            message.user_id,
+            channel._chat_id(message),
+            message.message_id,
+        ),
+        loop,
+    )
+    if (task_keyword or "").strip():
+        return "已按任务名/ID 查询，若匹配到多个任务会先发任务选择卡片。"
+    return "已发送任务筛选卡片，请让用户选择筛选条件后查看运行概况。"
+
+
+@tool
+def query_aicc_task_status(task_keyword: str = "") -> str:
+    """查询一知 AI 外呼任务的运行概况（状态、进度、通话效果、意向分布）。
+
+    Args:
+        task_keyword: 用户明确提到的任务名称片段或任务 ID；用户没有提到具体任务时留空。
+
+    用于回答「zlytest 这个任务跑得怎么样」「任务 1704345577064 现在什么状态」
+    「最近有哪些任务在跑」这类问题。
+    - 有关键词：先在真实任务列表里核对，唯一命中直接出概况卡，多个命中出候选卡；
+    - 没有关键词：发筛选卡（状态 / 排序 / 创建时间范围），再选择具体任务。
+    不要自己编造任务 ID，也不要假设任务状态。
+    """
+    return _open_status(task_keyword)
