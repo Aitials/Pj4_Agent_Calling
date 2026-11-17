@@ -82,3 +82,11 @@ class Channel(ABC):
     @abstractmethod
     async def send_typing(self, message: IncomingMessage, on: bool = True) -> None:
         """显示/隐藏“正在输入”状态；不支持的通道可为空实现。"""
+
+    async def send_card_to_chat(self, chat_id: str, card: dict) -> None:
+        """按会话 ID 主动发送卡片；不支持的通道抛错。"""
+        raise NotImplementedError(f"{self.name} 通道不支持发送卡片")
+
+    async def send_text_to_chat(self, chat_id: str, text: str) -> None:
+        """按会话 ID 主动发送文本；不支持的通道抛错。"""
+        raise NotImplementedError(f"{self.name} 通道不支持按 chat_id 主动发送")

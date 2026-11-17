@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any
 
 import lark_oapi as lark
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    CallBackCard,
+    CallBackToast,
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 from lark_oapi.api.cardkit.v1 import (
     ContentCardElementRequest,
     ContentCardElementRequestBody,
@@ -58,6 +64,11 @@ CARD_ELEMENT_ID = "answer"
 MAX_CARD_CHARS = 100_000
 MAX_FILE_BYTES = 30 * 1024 * 1024
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# 临时调试指令：发送 /cardtest 触发一张按钮测试卡片，用于验证卡片回调通路
+CARD_TEST_COMMAND = "/cardtest"
+# 任务表单调试入口：验证卡片流程时不依赖模型
+CREATE_FORM_COMMAND = "/createform"
+START_FORM_COMMAND = "/startform"
 
 _MEDIA_KINDS = {
     "image": "image",
@@ -210,6 +221,8 @@ class FeishuChannel(Channel):
         self._seen: deque[str] = deque()
         self._seen_set: set[str] = set()
         self._ws_thread: threading.Thread | None = None
+        # 任务表单卡片回调处理，由 router 注入
+        self._form_handler: Any = None
         _active_channel = self
 
     # ------------------------------------------------------------------ 启动
@@ -221,6 +234,7 @@ class FeishuChannel(Channel):
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_event)
+            .register_p2_card_action_trigger(self._on_card_action)
             .build()
         )
         ws = lark.ws.Client(
@@ -243,6 +257,21 @@ class FeishuChannel(Channel):
                 log.exception("飞书消息解析失败，已跳过")
                 continue
             if not message:
+                continue
+            # 临时调试：/cardtest 发一张按钮卡片，用于验证「发卡 → 点按钮 → 收回调」通路
+            if message.text.strip().lower() == CARD_TEST_COMMAND:
+                try:
+                    await self.send_test_card(message)
+                except Exception:
+                    log.exception("发送测试卡片失败")
+                continue
+            # 任务表单调试入口：不经过模型，直接发卡
+            command = message.text.strip().lower()
+            if command in (CREATE_FORM_COMMAND, START_FORM_COMMAND):
+                try:
+                    await self._open_task_form(command, message)
+                except Exception:
+                    log.exception("发送任务表单失败")
                 continue
             token = _current_message.set(message)
             try:
@@ -280,6 +309,212 @@ class FeishuChannel(Channel):
         while len(self._seen) > MAX_SEEN_IDS:
             old = self._seen.popleft()
             self._seen_set.discard(old)
+
+    # ------------------------------------------------------------ 卡片回调（最小闭环）
+
+    async def send_test_card(self, message: IncomingMessage) -> None:
+        """发一张带「确认 / 取消」按钮的静态卡片，点按钮只会回 toast 并原地更新。"""
+        card = {
+            "schema": "2.0",
+            "header": {
+                "title": {"tag": "plain_text", "content": "操作确认（回调通路测试）"},
+                "template": "blue",
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            "**任务名称**：回调测试任务\n"
+                            "**话术 ID**：66286\n"
+                            "**主叫线路**：057128215420（台铃测试）\n"
+                            "**并发 / BOT**：1 / 1\n\n"
+                            "这是一张测试卡片，点按钮不会创建或启动任何任务。"
+                        ),
+                    },
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "none",
+                        "horizontal_spacing": "default",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "elements": [
+                                    {
+                                        "tag": "button",
+                                        "text": {"tag": "plain_text", "content": "取消"},
+                                        "type": "default",
+                                        "width": "fill",
+                                        "behaviors": [
+                                            {
+                                                "type": "callback",
+                                                "value": {"action": "cancel", "scene": "card_test"},
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                            {
+                                "tag": "column",
+                                "width": "weighted",
+                                "weight": 1,
+                                "elements": [
+                                    {
+                                        "tag": "button",
+                                        "text": {"tag": "plain_text", "content": "确认创建"},
+                                        "type": "primary",
+                                        "width": "fill",
+                                        "behaviors": [
+                                            {
+                                                "type": "callback",
+                                                "value": {"action": "confirm", "scene": "card_test"},
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ]
+            },
+        }
+        content = json.dumps(card, ensure_ascii=False)
+        await self._send_content(message, "interactive", content)
+        log.info("测试卡片已发送 chat=%s", self._chat_id(message))
+
+    def _on_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        """卡片按钮回调：3 秒内必须返回，这里只回 toast 并替换卡片内容。"""
+        response = P2CardActionTriggerResponse()
+        try:
+            event = data.event
+            if not event or not event.action:
+                response.toast = CallBackToast({"type": "error", "content": "回调数据为空"})
+                return response
+
+            value = event.action.value or {}
+            action = str(value.get("action") or "")
+            scene = str(value.get("scene") or "")
+            operator = event.operator.open_id if event.operator else ""
+            context = event.context
+            log.info(
+                "收到卡片回调 scene=%s action=%s operator=%s chat=%s message=%s value=%s",
+                scene,
+                action,
+                operator,
+                getattr(context, "open_chat_id", ""),
+                getattr(context, "open_message_id", ""),
+                value,
+            )
+
+            form_value = getattr(event.action, "form_value", None) or {}
+            if action.startswith("task_"):
+                return self._handle_task_action(
+                    action, value, form_value, operator, context, response
+                )
+
+            if action == "confirm":
+                response.toast = CallBackToast({"type": "success", "content": "已收到确认（测试）"})
+                title, template = "已确认（测试）", "green"
+            elif action == "cancel":
+                response.toast = CallBackToast({"type": "info", "content": "已取消（测试）"})
+                title, template = "已取消（测试）", "grey"
+            else:
+                response.toast = CallBackToast({"type": "error", "content": "未知操作"})
+                title, template = "未知操作", "red"
+
+            result_card = {
+                "schema": "2.0",
+                "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": (
+                                f"**场景**：{scene or '-'}\n"
+                                f"**动作**：{action or '-'}\n"
+                                f"**操作人**：{operator or '-'}\n\n"
+                                "回调通路正常，正式确认逻辑将在下一步接入。"
+                            ),
+                        }
+                    ]
+                },
+            }
+            response.card = CallBackCard({"type": "raw", "data": result_card})
+            return response
+        except Exception:
+            log.exception("处理卡片回调失败")
+            response.toast = CallBackToast({"type": "error", "content": "处理回调失败，请查看日志"})
+            return response
+
+    def _handle_task_action(
+        self,
+        action: str,
+        value: dict,
+        form_value: dict,
+        operator: str,
+        context: Any,
+        response: P2CardActionTriggerResponse,
+    ) -> P2CardActionTriggerResponse:
+        """任务表单/确认按钮：3 秒内回 toast，真正的处理放到事件循环异步做。"""
+        # 取消是同步操作：作废 token 并把卡片原地关掉，避免用户以为还在流程里
+        if action == "task_form_cancel":
+            token = str(value.get("token") or "")
+            if token:
+                from app.core import forms
+
+                forms.pop_for(token, operator)
+            log.info("用户取消任务卡片流程 token=%s operator=%s", token, operator)
+            response.toast = CallBackToast({"type": "info", "content": "已取消"})
+            response.card = CallBackCard(
+                {
+                    "type": "raw",
+                    "data": {
+                        "schema": "2.0",
+                        "header": {
+                            "title": {"tag": "plain_text", "content": "已取消"},
+                            "template": "grey",
+                        },
+                        "body": {
+                            "elements": [
+                                {"tag": "markdown", "content": "本次操作已取消，不会提交到平台。"}
+                            ]
+                        },
+                    },
+                }
+            )
+            return response
+
+        if self._form_handler is None or self._loop is None:
+            response.toast = CallBackToast({"type": "error", "content": "服务尚未就绪，请稍后重试"})
+            return response
+
+        chat_id = str(getattr(context, "open_chat_id", "") or "")
+        message_id = str(getattr(context, "open_message_id", "") or "")
+
+        asyncio.run_coroutine_threadsafe(
+            self._form_handler(
+                action, value, form_value, operator, chat_id, message_id
+            ),
+            self._loop,
+        )
+
+        if action.endswith("_confirm") or action.endswith("_step1") or action.endswith("_step2"):
+            response.toast = CallBackToast({"type": "success", "content": "已提交，正在处理"})
+            response.card = CallBackCard(
+                {
+                    "type": "raw",
+                    "data": {
+                        "schema": "2.0",
+                        "header": {"title": {"tag": "plain_text", "content": "处理中"}, "template": "grey"},
+                        "body": {"elements": [{"tag": "markdown", "content": "已提交，请稍候…"}]},
+                    },
+                }
+            )
+        else:
+            response.toast = CallBackToast({"type": "info", "content": "正在刷新…"})
+        return response
 
     # ------------------------------------------------------------------ 收消息
 
@@ -449,12 +684,17 @@ class FeishuChannel(Channel):
 
     async def reply_stream(self, message: IncomingMessage, chunks) -> str:
         answer = ""
-        card_id = await self._create_and_send_card(message)
+        card_id: str | None = None
+        card_attempted = False
         sequence = 1
         last_push = 0.0
         try:
             async for delta in chunks:
                 answer += delta
+                # 懒创建：本轮没有文本输出时（例如只发了卡片）就不发空卡片
+                if card_id is None and not card_attempted:
+                    card_attempted = True
+                    card_id = await self._create_and_send_card(message)
                 now = time.monotonic()
                 if card_id and now - last_push >= STREAM_INTERVAL_SECONDS:
                     sequence += 1
@@ -476,12 +716,72 @@ class FeishuChannel(Channel):
                 await self.reply_text(message, answer or "（没有生成内容）")
             return answer
 
-        await self.reply_text(message, answer or "（没有生成内容）")
+        if answer:
+            await self.reply_text(message, answer)
         return answer
 
     async def send_typing(self, message: IncomingMessage, on: bool = True) -> None:
         # 飞书机器人没有官方 typing 接口，保持无操作。
         return None
+
+    # ------------------------------------------------------------ 任务表单卡片
+
+    def set_form_handler(self, handler: Any) -> None:
+        """注入任务卡片流程处理函数（router 负责绑定 channel）。"""
+        self._form_handler = handler
+
+    async def _open_task_form(self, command: str, message: IncomingMessage) -> None:
+        if self._form_handler is None:
+            await self.reply_text(message, "任务表单流程尚未就绪，请稍后重试。")
+            return
+        action = (
+            "debug_open_create"
+            if command == CREATE_FORM_COMMAND
+            else "debug_open_start"
+        )
+        await self._form_handler(
+            action, {}, {}, message.user_id, self._chat_id(message), message.message_id
+        )
+
+    async def send_card_to_chat(self, chat_id: str, card: dict) -> None:
+        """按 chat_id 发送一张卡片（卡片 JSON 对象）。"""
+        if not chat_id:
+            raise RuntimeError("飞书发送失败：缺少 chat_id")
+        content = json.dumps(card, ensure_ascii=False)
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        response = await asyncio.to_thread(self._client.im.v1.message.create, request)
+        self._ensure_success(response, "发送卡片")
+
+    async def send_text_to_chat(self, chat_id: str, text: str) -> None:
+        """按 chat_id 主动发一条文本（用于恢复执行后的结果回传）。"""
+        if not chat_id:
+            raise RuntimeError("飞书发送失败：缺少 chat_id")
+        content = json.dumps({"text": _plain_text(text) or "（没有生成内容）"}, ensure_ascii=False)
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        response = await asyncio.to_thread(self._client.im.v1.message.create, request)
+        self._ensure_success(response, "发送消息")
 
     async def _create_and_send_card(self, message: IncomingMessage) -> str | None:
         try:

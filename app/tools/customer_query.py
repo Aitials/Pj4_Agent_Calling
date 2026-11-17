@@ -168,7 +168,7 @@ def _render_summary(rows: list[dict]) -> str:
 
 @tool
 def query_customer_profile(keyword: str, limit: int = 10) -> str:
-    """查询客户（企业）档案，返回企业工商信息与该企业名下的联系电话。
+    """查询本地SQL数据库中的客户（企业）档案，返回企业工商信息与该企业名下的联系电话。
 
     查询顺序依次兜底：① 企业名称模糊匹配 ② 法人姓名模糊匹配 ③ 电话号码精确匹配。
     因此企业名称、企业简称、法人名字、电话号码都可以直接作为关键字。

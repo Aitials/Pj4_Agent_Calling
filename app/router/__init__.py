@@ -50,6 +50,8 @@ async def handle_message(channel: Channel, message: IncomingMessage) -> None:
     1. thread_id = 会话标识，历史状态自动从 PG 加载
     2. Agent 只接收本轮 user 消息
     3. 回复完成后无需手工写库
+
+    创建/启动任务的参数由卡片收集，Agent 只负责发卡。
     """
     conv_id = message.conversation_id or message.user_id
     log.info("收到 [%s] conversation=%s user=%s: %s",
@@ -83,6 +85,23 @@ async def handle_message(channel: Channel, message: IncomingMessage) -> None:
                 log.debug("关闭 typing 状态失败", exc_info=True)
 
 
+async def handle_task_card_action(
+    channel: Channel,
+    action: str,
+    value: dict,
+    form_value: dict,
+    operator: str,
+    chat_id: str,
+    message_id: str,
+) -> None:
+    """飞书任务卡片回调：转交给流程编排层。"""
+    from app.flows import aicc_task_flow
+
+    await aicc_task_flow.handle_action(
+        channel, action, value, form_value, operator, chat_id, message_id
+    )
+
+
 def create_channel(name: str) -> Channel:
     if name == "feishu":
         from app.channels.feishu import FeishuChannel
@@ -95,6 +114,9 @@ async def run_channel(name: str) -> None:
     global _AGENT
     channel = create_channel(name)
     await init_agent()
+    setter = getattr(channel, "set_form_handler", None)
+    if setter is not None:
+        setter(partial(handle_task_card_action, channel))
     log.info("通道已启动：%s", channel.name)
     try:
         await channel.start(partial(handle_message, channel))
