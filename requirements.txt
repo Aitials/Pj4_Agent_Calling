@@ -9,3 +9,11 @@ redis>=5.0.0
 # Agent 短期记忆（LangGraph checkpoint）
 langgraph-checkpoint-postgres>=3.2.0
 psycopg[binary,pool]>=3.3.0
+# 一知回调接收
+fastapi>=0.115.0
+uvicorn>=0.32.0
+defusedxml>=0.7.1
+pycryptodome>=3.20.0
+
+# 回调加解密（selftest 依赖）
+pycryptodome>=3.20.0

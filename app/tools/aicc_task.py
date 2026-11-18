@@ -15,15 +15,24 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.clients import tanyibot
+from app.core.aicc_enums import (
+    ACTIVE_TASK_STATUSES,
+    ENDED_TASK_STATUSES,
+    STARTABLE_TASK_STATUSES,
+)
+from app.tools.aicc_task_status import fetch_status
 
 SYSTEM_TYPE = "CALL_OUT"
-PHONE_TYPES = ("LANDLINE", "MOBILE")
 DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
 MODES = ("MANUAL", "AUTO")
 REDIAL_CONDITIONS = (
     "CALL_LOSS", "NO_ANSWER", "BUSY", "REFUSED", "POWER_OFF",
     "OUT_OF_SERVICE", "CAN_NOT_CONNECT", "FROM_PHONE_ERROR", "SYSTEM_ERROR",
 )
+LINE_TYPE_HINTS = {
+    "MOBILE": "手机线路需先在平台开通通讯网关，否则任务会被系统挂起",
+    "CALL_POLICY_GROUP": "外呼策略组需先在平台配置策略，否则任务无法启动",
+}
 _DAY_ALIASES = {
     "周一": "MONDAY", "星期一": "MONDAY", "礼拜一": "MONDAY",
     "周二": "TUESDAY", "星期二": "TUESDAY", "礼拜二": "TUESDAY",
@@ -33,9 +42,9 @@ _DAY_ALIASES = {
     "周六": "SATURDAY", "星期六": "SATURDAY", "礼拜六": "SATURDAY",
     "周日": "SUNDAY", "周天": "SUNDAY", "星期日": "SUNDAY", "星期天": "SUNDAY", "礼拜日": "SUNDAY",
 }
-_STARTABLE = {"NOT_STARTED", "PAUSED", "USER_PAUSE", "STOPPED"}
-_RUNNING = {"IN_PROGRESS"}
-_FINISHED = {"COMPLETED", "ARCHIVED"}
+_STARTABLE = STARTABLE_TASK_STATUSES
+_RUNNING = ACTIVE_TASK_STATUSES
+_FINISHED = ENDED_TASK_STATUSES
 
 
 def normalize_time(raw: str, label: str) -> str:
@@ -76,12 +85,21 @@ def normalize_days(raw: list[str] | str) -> list[str]:
     return [day for day in DAYS if day in picked]
 
 
-def check_lines(ids: list[int], phone_type: str) -> tuple[list[dict], int]:
+def load_active_lines() -> dict[str, list[dict]]:
+    """一次拉取按 phoneType 分组的可用线路，供类型判断与可用性校验共用。"""
+    return tanyibot.get("/apiEngine/tenantPhoneNumber/getActive") or {}
+
+
+def check_lines(
+    ids: list[int],
+    phone_type: str,
+    lines_by_type: dict[str, list[dict]] | None = None,
+) -> tuple[list[dict], int]:
     """校验线路可用性，返回 (可用线路对象, 并发上限)。"""
     if not ids:
         raise ValueError("主叫线路不能为空，请先查询可用线路 ID")
 
-    data = tanyibot.get("/apiEngine/tenantPhoneNumber/getActive") or {}
+    data = lines_by_type if lines_by_type is not None else load_active_lines()
     lines = data.get(phone_type) or []
     by_id = {
         int(line["tenantPhoneNumberId"]): line
@@ -118,9 +136,9 @@ def check_lines(ids: list[int], phone_type: str) -> tuple[list[dict], int]:
     return usable, (min(limits) if limits else 0)
 
 
-def line_type_of(ids: list[int]) -> str:
-    """根据线路 ID 反查线路类型（LANDLINE / MOBILE）。"""
-    data = tanyibot.get("/apiEngine/tenantPhoneNumber/getActive") or {}
+def line_type_of(ids: list[int], lines_by_type: dict[str, list[dict]] | None = None) -> str:
+    """根据线路 ID 反查线路类型（LANDLINE / MOBILE / CALL_POLICY_GROUP）。"""
+    data = lines_by_type if lines_by_type is not None else load_active_lines()
     for phone_type, lines in data.items():
         for line in lines or []:
             if int(line.get("tenantPhoneNumberId") or 0) in ids:
@@ -212,15 +230,26 @@ def create_call_task(
         redial_interval = int(redial_interval)
         if redial_times < 0 or redial_interval < 0:
             raise ValueError("重拨次数与重拨间隔不能为负数")
+        if redial_times > 10:
+            raise ValueError("重拨次数取值范围为 1-10（1 表示对同一客户共呼两次）")
+        if redial_interval > 10000:
+            raise ValueError("重拨间隔最大 10000 分钟")
+        if redial_times and not redial_interval:
+            raise ValueError("填写重拨次数时必须同时填写重拨间隔（分钟）")
+        if redial_interval and not redial_times:
+            raise ValueError("填写重拨间隔时必须同时填写重拨次数")
 
         conditions = [str(item).strip().upper() for item in (redial_condition or []) if str(item).strip()]
         invalid = [item for item in conditions if item not in REDIAL_CONDITIONS]
         if invalid:
             raise ValueError(f"不支持的重拨条件：{'、'.join(invalid)}")
+        if conditions and not redial_times:
+            raise ValueError("设置重拨条件前需先填写重拨次数与重拨间隔（分钟）")
 
         ids = [int(pid) for pid in phone_number_ids]
-        phone_type = line_type_of(ids)
-        usable, limit = check_lines(ids, phone_type)
+        lines_by_type = load_active_lines()
+        phone_type = line_type_of(ids, lines_by_type)
+        usable, limit = check_lines(ids, phone_type, lines_by_type)
         if limit and concurrency > limit:
             raise ValueError(
                 f"并发数 {concurrency} 超过线路并发上限 {limit}"
@@ -276,21 +305,23 @@ def create_call_task(
     lines_text = "、".join(
         f"{line['tenantPhoneNumberId']}（{line.get('phoneNumber') or '-'}）" for line in usable
     )
-    return "\n".join(
-        [
-            "✅ 外呼任务已创建",
-            f"- 任务 ID：{job_id if job_id is not None else '未返回，请到平台确认'}",
-            f"- 任务名称：{name}",
-            f"- 话术 ID：{dialog_flow_id}",
-            f"- 主叫线路：{lines_text}",
-            f"- 线路类型：{phone_type}",
-            f"- 并发 / BOT：{concurrency} / {robots}",
-            f"- 拨打时段：{start_time} - {end_time}",
-            f"- 拨打星期：{'、'.join(days)}",
-            f"- 启动方式：{mode}",
-            "- 当前状态：NOT_STARTED（尚未导入客户，需导入客户后才能实际外呼）",
-        ]
-    )
+    result = [
+        "✅ 外呼任务已创建",
+        f"- 任务 ID：{job_id if job_id is not None else '未返回，请到平台确认'}",
+        f"- 任务名称：{name}",
+        f"- 话术 ID：{dialog_flow_id}",
+        f"- 主叫线路：{lines_text}",
+        f"- 线路类型：{phone_type}",
+        f"- 并发 / BOT：{concurrency} / {robots}",
+        f"- 拨打时段：{start_time} - {end_time}",
+        f"- 拨打星期：{'、'.join(days)}",
+        f"- 启动方式：{mode}",
+        "- 当前状态：NOT_STARTED（尚未导入客户，需导入客户后才能实际外呼）",
+    ]
+    hint = LINE_TYPE_HINTS.get(phone_type)
+    if hint:
+        result.append(f"- 提示：{hint}")
+    return "\n".join(result)
 
 
 def start_call_task(robot_call_job_id: int) -> str:
@@ -341,21 +372,6 @@ def start_call_task(robot_call_job_id: int) -> str:
     if (latest.get("status") or status) == "NOT_STARTED":
         lines.append("- 提示：状态仍为 NOT_STARTED，可能因未导入客户或当前不在拨打时段")
     return "\n".join(lines)
-
-
-def fetch_status(job_id: int) -> dict:
-    """getStatus 返回单键对象数组，需要遍历取值。"""
-    rows = tanyibot.get(
-        "/apiEngine/robotCallJob/getStatus",
-        params={"robotCallJobIds": str(job_id), "systemType": SYSTEM_TYPE},
-    ) or []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        value = row.get(str(job_id))
-        if isinstance(value, dict):
-            return value
-    return {}
 
 
 def job_brief(job_id: int) -> dict:

@@ -16,33 +16,17 @@ from datetime import date, datetime, timedelta
 
 from app.clients import tanyibot
 from app.core import cache
+from app.core.aicc_enums import (
+    ENDED_TASK_STATUSES as ENDED_STATUSES,
+    PAUSED_TASK_STATUSES as PAUSED_STATUSES,
+    RUNNING_TASK_STATUSES as RUNNING_STATUSES,
+    TASK_STATUS_LABELS as STATUS_LABELS,
+)
 
 SYSTEM_TYPE = "CALL_OUT"
 PAGE_SIZE = 50
 MAX_PAGES = 4
 LIST_PAGE_SIZE = 10
-
-STATUS_LABELS = {
-    "NOT_STARTED": "未开始",
-    "RUNNABLE": "待运行",
-    "IN_QUEUE": "排队中",
-    "IN_PROCESS": "进行中",
-    "USER_PAUSE": "用户暂停",
-    "SYSTEM_SUSPENDED": "系统暂停",
-    "MAINTAIN": "系统维护",
-    "WAITING_FOR_REDIAL": "等待重拨",
-    "EXPIRED": "已过期",
-    "SYSTEM_HANG_UP": "系统挂起",
-    "COMPLETED": "已完成",
-    "TERMINATE": "已终止",
-    "ARCHIVED": "已归档",
-    "PAUSED": "已暂停",
-    "STOPPED": "已停止",
-}
-
-ENDED_STATUSES = {"COMPLETED", "TERMINATE", "ARCHIVED", "EXPIRED"}
-PAUSED_STATUSES = {"USER_PAUSE", "SYSTEM_SUSPENDED", "MAINTAIN", "WAITING_FOR_REDIAL"}
-RUNNING_STATUSES = {"IN_PROCESS", "RUNNABLE", "IN_QUEUE"}
 
 ORDER_TYPES = {
     "CREATE_TIME": "按创建时间排序",

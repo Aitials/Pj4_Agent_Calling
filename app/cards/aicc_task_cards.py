@@ -267,8 +267,8 @@ def build_create_form_step2(
         _select("on_working_days", "仅法定工作日", [_option("否", "false"), _option("是", "true")]),
         _input("description", "任务描述", placeholder="可不填", max_length=500),
         _select("folder_id", "任务文件夹", folder_options if folders else [_option("不放入文件夹", 0)]),
-        _input("redial_times", "重拨次数", default="0", placeholder="默认 0（不重拨）"),
-        _input("redial_interval", "重拨间隔（秒）", default="0", placeholder="默认 0"),
+        _input("redial_times", "重拨次数", default="0", placeholder="默认 0（不重拨），取值 1-10"),
+        _input("redial_interval", "重拨间隔（分钟）", default="0", placeholder="默认 0；与重拨次数需同时填写"),
         _select(
             "redial_condition",
             "重拨条件（可多选）",

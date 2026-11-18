@@ -382,8 +382,9 @@ def _parse_step1(form_value: dict) -> dict:
         raise ValueError("每日开始时间必须早于结束时间")
 
     days = aicc_task.normalize_days(_as_list(form_value.get("days_of_week")))
-    phone_type = aicc_task.line_type_of(ids)
-    _usable, limit = aicc_task.check_lines(ids, phone_type)
+    lines_by_type = aicc_task.load_active_lines()
+    phone_type = aicc_task.line_type_of(ids, lines_by_type)
+    _usable, limit = aicc_task.check_lines(ids, phone_type, lines_by_type)
     if limit and concurrency > limit:
         raise ValueError(f"并发数 {concurrency} 超过线路并发上限 {limit}")
 
@@ -514,12 +515,15 @@ async def _create_step2(channel, token, form_value, operator, chat_id, message_i
         ("拨打星期", "、".join(str(item) for item in params.get("days_of_week") or [])),
         ("启动方式", params.get("mode", "MANUAL")),
         ("优先级", params.get("priority", 100)),
-        ("重拨", f"{params.get('redial_times', 0)} 次 / 间隔 {params.get('redial_interval', 0)} 秒"),
+        ("重拨", f"{params.get('redial_times', 0)} 次 / 间隔 {params.get('redial_interval', 0)} 分钟"),
         ("转人工坐席组", params.get("cs_staff_group_id", 0)),
         ("短信模板", params.get("sms_template_id", 0)),
         ("客户白名单组", params.get("customer_white_group_ids") or "无"),
         ("任务描述", params.get("description") or ""),
     ]
+    hint = aicc_task.LINE_TYPE_HINTS.get(str(params.get("phone_type") or ""))
+    if hint:
+        fields.append(("线路类型提示", hint))
     await channel.send_card_to_chat(
         chat_id, cards.build_task_confirm(token=token, kind="create", fields=fields)
     )
