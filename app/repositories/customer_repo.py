@@ -229,3 +229,51 @@ def search_customers(keyword: str, limit: int = 10) -> list[dict]:
         row["contacts"] = contacts.get(code, [])
         row["match_type"] = match_type
     return rows
+
+
+def get_company_name(credit_code: str) -> str | None:
+    """按信用代码取企业名称，供通知卡片展示。"""
+    code = (credit_code or "").strip()
+    if not code:
+        return None
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT `company_name` FROM `customer_profile` WHERE `credit_code` = %s LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            return str(row["company_name"]) if row and row.get("company_name") else None
+    except pymysql.MySQLError as exc:
+        _raise_query_error(exc)
+        return None
+    finally:
+        conn.close()
+
+
+def refresh_call_aggregates(credit_code: str) -> None:
+    """按 call_record 重算企业通话次数与最近通话时间，重复执行安全。"""
+    code = (credit_code or "").strip()
+    if not code:
+        return
+    sql = (
+        "UPDATE `customer_profile` AS p "
+        "SET p.`call_times` = ("
+        "      SELECT COUNT(*) FROM `call_record` AS c WHERE c.`credit_code` = p.`credit_code`"
+        "    ), "
+        "    p.`last_call_at` = ("
+        "      SELECT MAX(c.`call_time`) FROM `call_record` AS c WHERE c.`credit_code` = p.`credit_code`"
+        "    ) "
+        "WHERE p.`credit_code` = %s"
+    )
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (code,))
+        conn.commit()
+    except pymysql.MySQLError as exc:
+        conn.rollback()
+        _raise_query_error(exc)
+    finally:
+        conn.close()
