@@ -6,5 +6,6 @@ __pycache__/
 .idea/
 .idea/workspace.xml
 state/
+.workbuddy/
 
 AI messages
