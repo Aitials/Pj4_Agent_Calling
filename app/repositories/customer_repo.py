@@ -231,6 +231,57 @@ def search_customers(keyword: str, limit: int = 10) -> list[dict]:
     return rows
 
 
+def get_contact_guard(phone: str) -> dict | None:
+    """按号码取阻断标记（号码级黑名单 + 企业级黑名单），供派单前闸门使用。"""
+    phone = (phone or "").strip()
+    if not phone:
+        return None
+    sql = (
+        "SELECT c.`is_blacklist`, c.`block_reason`, "
+        "       p.`is_blacklist` AS `profile_blacklist` "
+        "FROM `customer_contact` AS c "
+        "LEFT JOIN `customer_profile` AS p ON p.`credit_code` = c.`credit_code` "
+        "WHERE c.`phone` = %s LIMIT 1"
+    )
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (phone,))
+            return cur.fetchone()
+    except pymysql.MySQLError as exc:
+        _raise_query_error(exc)
+        return None
+    finally:
+        conn.close()
+
+
+def mark_contact_blocked(phone: str, reason: str, conn=None) -> int:
+    """把阻断原因回写到号码表（已有原因时不覆盖），返回影响行数。"""
+    phone = (phone or "").strip()
+    if not phone or not reason:
+        return 0
+    sql = (
+        "UPDATE `customer_contact` SET `block_reason` = %s "
+        "WHERE `phone` = %s AND (`block_reason` IS NULL OR `block_reason` = '')"
+    )
+    own_conn = conn is None
+    conn = conn or connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (str(reason)[:32], phone))
+            affected = cur.rowcount
+        if own_conn:
+            conn.commit()
+        return int(affected)
+    except pymysql.MySQLError:
+        if own_conn:
+            conn.rollback()
+        raise
+    finally:
+        if own_conn:
+            conn.close()
+
+
 def get_company_name(credit_code: str) -> str | None:
     """按信用代码取企业名称，供通知卡片展示。"""
     code = (credit_code or "").strip()

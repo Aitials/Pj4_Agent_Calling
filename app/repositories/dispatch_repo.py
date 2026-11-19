@@ -7,7 +7,7 @@ from datetime import date, datetime
 
 import pymysql
 
-from app.repositories.customer_repo import connect
+from app.repositories.customer_repo import connect, get_company_name
 
 log = logging.getLogger("dispatch_repo")
 
@@ -167,11 +167,12 @@ def set_task_guid(notice_id: int, task_guid: str) -> None:
 
 
 def mark_sent(notice_id: int, task_guid: str | None, message_id: str | None) -> None:
+    # 只允许 SENDING → SENT：若发送期间被 AI 判定撤销（CANCELLED），不覆盖撤销状态
     _update(
         "UPDATE `dispatch_notice` "
         "SET `status` = 'SENT', `sent_at` = NOW(), `feishu_task_guid` = %s, "
         "    `card_message_id` = %s, `error_msg` = NULL, `next_retry_at` = NULL "
-        "WHERE `id` = %s",
+        "WHERE `id` = %s AND `status` = 'SENDING'",
         (task_guid, message_id, int(notice_id)),
     )
 
@@ -192,7 +193,7 @@ def mark_failed(
         "UPDATE `dispatch_notice` "
         "SET `status` = %s, `error_msg` = %s, `retry_count` = %s, "
         "    `next_retry_at` = %s, `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`) "
-        "WHERE `id` = %s",
+        "WHERE `id` = %s AND `status` = 'SENDING'",
         (status, error_msg[:512], int(retry_count), next_retry_at, task_guid, int(notice_id)),
     )
 
@@ -460,6 +461,74 @@ def get_notice_by_record(record_id: str) -> dict | None:
             return cur.fetchone()
     finally:
         conn.close()
+
+
+def cancel_notice(record_id: str, reason: str = "") -> str | None:
+    """AI 否决派单时把通知置为 CANCELLED，返回撤销前的状态；无通知返回 None。
+
+    撤销后基础通知不会被 claim_pending 再发送，分析卡片与附件也一并停发。
+    """
+    record_id = (record_id or "").strip()
+    if not record_id:
+        return None
+    conn = connect()
+    try:
+        conn.begin()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT `id`, `status` FROM `dispatch_notice` "
+                "WHERE `trigger_record_id` = %s ORDER BY `id` LIMIT 1 FOR UPDATE",
+                (record_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            cur.execute(
+                "UPDATE `dispatch_notice` "
+                "SET `status` = 'CANCELLED', `error_msg` = %s, "
+                "    `analysis_status` = CASE WHEN `analysis_status` IN ('PENDING', 'SENDING') "
+                "                             THEN NULL ELSE `analysis_status` END, "
+                "    `attachment_status` = CASE WHEN `attachment_status` IN ('PENDING', 'UPLOADING', 'FAILED') "
+                "                               THEN 'SKIPPED' ELSE `attachment_status` END, "
+                "    `updated_at` = NOW() "
+                "WHERE `id` = %s",
+                (str(reason)[:512] or None, int(row["id"])),
+            )
+        conn.commit()
+        return str(row.get("status") or "")
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def enqueue_ai_notice(record: dict) -> int | None:
+    """供应商未触发但 AI 判为高意向时补派单，trigger_source 记为 AI。"""
+    record_id = str(record.get("record_id") or "").strip()
+    credit_code = str(record.get("credit_code") or "").strip()
+    if not record_id or not credit_code:
+        log.warning("通话 %s 缺少信用代码，无法补派单", record_id)
+        return None
+    if get_notice_by_record(record_id):
+        return None
+    assignee = next_assignee()
+    if not assignee:
+        log.warning("销售名单为空，通话 %s 无法补派单", record_id)
+        return None
+
+    notice = {
+        "credit_code": credit_code,
+        "company_name": record.get("customer_name") or get_company_name(credit_code),
+        "trigger_record_id": record_id,
+        "trigger_phone": record.get("customer_phone"),
+        "assignee_open_id": assignee["open_id"],
+        "assignee_name": assignee.get("name"),
+        "trigger_source": "AI",
+        "notice_date": date.today(),
+    }
+    return enqueue_notice(notice)
 
 
 def _update(sql: str, params: tuple) -> None:

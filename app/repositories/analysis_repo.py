@@ -141,6 +141,23 @@ def save_analysis(
         conn.close()
 
 
+def set_level_consistent(analysis_id: int, consistent: int | None) -> None:
+    """回写与供应商标签的一致性：0 不一致 / 1 一致 / None 无法比较。"""
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE `agent_analysis` SET `level_consistent` = %s WHERE `id` = %s",
+                (consistent, int(analysis_id)),
+            )
+        conn.commit()
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_current(record_id: str) -> dict | None:
     """取该通话的最新版本分析结果。"""
     conn = connect()

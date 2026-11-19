@@ -21,7 +21,7 @@ def persist_record(
     notify: bool = True,
     with_profile: bool = True,
 ) -> dict:
-    """写入单条通话记录；命中高意向时同时创建通知与分析任务。
+    """写入单条通话记录；命中高意向且未被阻断时同时创建通知与分析任务。
 
     返回 {"saved": bool, "notice_id": int|None}。
     """
@@ -34,7 +34,14 @@ def persist_record(
     assignee = None
     trigger_source = "SUPPLIER"
 
-    if notify:
+    # 派单硬闸门：空号/拒接/黑名单/勿扰不通知销售，但通话记录仍要入库留档
+    block_reason = intent.check_block(
+        record, customer_repo.get_contact_guard(record.get("customer_phone"))
+    )
+    if block_reason:
+        log.info("通话 %s 命中阻断(%s)，跳过派单", record_id, block_reason)
+
+    if notify and not block_reason:
         should_notify, _rule = intent.evaluate(record)
         if should_notify and credit_code:
             # 已入队过就不再轮转销售，避免同一通话分配到不同人
@@ -51,6 +58,12 @@ def persist_record(
         conn.begin()
         call_record_repo.upsert_call_record(record, conn=conn)
 
+        writeback_reason = intent.contact_block_reason(block_reason or "")
+        if writeback_reason:
+            customer_repo.mark_contact_blocked(
+                record.get("customer_phone"), writeback_reason, conn=conn
+            )
+
         if assignee:
             notice = {
                 "credit_code": credit_code,
@@ -63,13 +76,15 @@ def persist_record(
                 "notice_date": date.today(),
             }
             notice_id = dispatch_repo.enqueue_notice(notice, conn=conn)
-            if notice_id:
-                lead_brief_repo.enqueue(
-                    record_id,
-                    credit_code,
-                    record.get("intent_level_code"),
-                    conn=conn,
-                )
+
+        # 所有有转写的通话都进分析队列：AI 才能对供应商标签未命中的通话做最终判定
+        if record.get("asr_transcript") and not block_reason:
+            lead_brief_repo.enqueue(
+                record_id,
+                credit_code,
+                record.get("intent_level_code"),
+                conn=conn,
+            )
         conn.commit()
     except Exception:
         conn.rollback()
