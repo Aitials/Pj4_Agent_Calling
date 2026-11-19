@@ -145,21 +145,28 @@ def _serialize(column: str, value: Any) -> Any:
     return value
 
 
-def upsert_call_record(row: dict) -> None:
-    """按 record_id 幂等写入；重复回调只更新，不新增。"""
+def upsert_call_record(row: dict, conn=None) -> None:
+    """按 record_id 幂等写入；重复回调只更新，不新增。
+
+    传入 conn 时复用调用方事务，不提交也不关闭，由调用方统一提交/回滚。
+    """
     values = [_serialize(column, row.get(column)) for column in _COLUMNS]
-    conn = connect()
+    own_conn = conn is None
+    conn = conn or connect()
     try:
         with conn.cursor() as cur:
             cur.execute(_UPSERT_SQL, values)
         # pymysql 的连接上下文只负责关闭，不自动提交，必须显式 commit
-        conn.commit()
+        if own_conn:
+            conn.commit()
     except pymysql.MySQLError as exc:
-        conn.rollback()
+        if own_conn:
+            conn.rollback()
         log.error("写入 call_record 失败 record_id=%s：%s", row.get("record_id"), exc)
         raise
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def get_call_record(record_id: str) -> dict | None:

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 from app.callback.parsers import CallRecordEvent, parse_payload
 from app.repositories import call_record_repo
+from app.services import ingest
 
 log = logging.getLogger("aicc_callback.service")
 
@@ -65,7 +66,7 @@ def handle_event(event: CallRecordEvent) -> dict:
         "callback_data_type": event.data_type,
         "raw_json": event.raw,
     }
-    call_record_repo.upsert_call_record(row)
+    ingest.persist_record(row)
 
     summary = {
         "record_id": event.record_id,

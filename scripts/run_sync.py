@@ -17,7 +17,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.repositories.customer_repo import connect  # noqa: E402
-from app.services import call_record_sync, dispatch  # noqa: E402
+from app.services import call_record_sync  # noqa: E402
 
 log = logging.getLogger("run_sync")
 
@@ -77,14 +77,14 @@ def run_once(args) -> tuple[int, int, int]:
         with_profile=not args.no_profile,
     )
     records = [record for summary in summaries for record in summary.get("records") or []]
-    created = dispatch.enqueue_records(records)
+    notified = sum(int(summary.get("notified") or 0) for summary in summaries)
     log.info(
-        "同步轮次完成：任务 %s 个，记录 %s 条，入队 %s 条",
+        "同步轮次完成：任务 %s 个，记录 %s 条，派单 %s 条",
         len(summaries),
         len(records),
-        len(created),
+        notified,
     )
-    return len(summaries), len(records), len(created)
+    return len(summaries), len(records), notified
 
 
 def main() -> int:

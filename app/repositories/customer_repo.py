@@ -252,6 +252,19 @@ def get_company_name(credit_code: str) -> str | None:
         conn.close()
 
 
+def get_profile(credit_code: str) -> dict | None:
+    """按统一社会信用代码取企业档案，附带全部关联号码。"""
+    code = (credit_code or "").strip()
+    if not code:
+        return None
+    rows = _query_profiles("`credit_code` = %s", (code,), 1)
+    if not rows:
+        return None
+    row = rows[0]
+    row["contacts"] = _fetch_contacts([code]).get(code, [])
+    return row
+
+
 def refresh_call_aggregates(credit_code: str) -> None:
     """按 call_record 重算企业通话次数与最近通话时间，重复执行安全。"""
     code = (credit_code or "").strip()

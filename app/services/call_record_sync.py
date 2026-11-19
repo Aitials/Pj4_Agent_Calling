@@ -13,7 +13,8 @@ from typing import Any
 from app.callback.parsers import _build_transcript
 from app.clients import aicc_call_record, tanyibot
 from app.core.aicc_enums import ENDED_TASK_STATUSES, normalize_call_status
-from app.repositories import call_record_repo, customer_repo, sync_log_repo
+from app.repositories import call_record_repo, sync_log_repo
+from app.services import ingest
 from app.tools import aicc_task_status
 
 log = logging.getLogger("call_record_sync")
@@ -130,6 +131,7 @@ def sync_job(
     rows = aicc_call_record.list_records(int(job_id), start, end)
     records: list[dict] = []
     saved = 0
+    notified = 0
     detail_calls = 0
 
     for row in rows:
@@ -170,29 +172,29 @@ def sync_job(
         if dry_run:
             continue
 
-        call_record_repo.upsert_call_record(record)
-        saved += 1
-        if with_profile and record.get("credit_code"):
-            try:
-                customer_repo.refresh_call_aggregates(record["credit_code"])
-            except Exception as exc:  # noqa: BLE001
-                log.warning("刷新企业档案聚合失败 credit=%s：%s", record["credit_code"], exc)
+        result = ingest.persist_record(record, with_profile=with_profile)
+        if result.get("saved"):
+            saved += 1
+        if result.get("notice_id"):
+            notified += 1
 
     cursor_time = max(
         (row["call_time"] for row in records if isinstance(row.get("call_time"), datetime)),
         default=None,
     )
     log.info(
-        "任务 %s 拉取完成：列表 %s 条，详情 %s 次，入库 %s 条",
+        "任务 %s 拉取完成：列表 %s 条，详情 %s 次，入库 %s 条，派单 %s 条",
         job_id,
         len(rows),
         detail_calls,
         saved,
+        notified,
     )
     return {
         "job_id": int(job_id),
         "fetched": len(rows),
         "saved": saved,
+        "notified": notified,
         "detail_calls": detail_calls,
         "records": records,
         "cursor_time": cursor_time,

@@ -10,6 +10,7 @@ lark.Client 内部自动获取并缓存 tenant_access_token，无需手动刷新
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import uuid as uuid_lib
@@ -21,9 +22,20 @@ from lark_oapi.api.contact.v3 import (
     BatchGetIdUserRequestBody,
     ListUserRequest,
 )
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-from lark_oapi.api.task.v2 import CreateTaskRequest
-from lark_oapi.api.task.v2.model import Due, InputTask, Member, Start
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBody,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
+)
+from lark_oapi.api.task.v2 import (
+    CreateTaskRequest,
+    GetAttachmentRequest,
+    PatchTaskRequest,
+    PatchTaskRequestBody,
+    UploadAttachmentRequest,
+)
+from lark_oapi.api.task.v2.model import Due, InputAttachment, InputTask, Member, Start
 
 from app.core.config import FEISHU_APP_ID, FEISHU_APP_SECRET
 
@@ -249,6 +261,27 @@ def send_card(
     )
 
 
+def update_card(message_id: str, card: dict) -> dict:
+    """更新已发送的卡片内容（需 im:message 权限，且仅支持应用发送的消息）。"""
+    if not message_id:
+        raise ValueError("message_id 不能为空")
+
+    body = (
+        PatchMessageRequestBody.builder()
+        .content(json.dumps(card, ensure_ascii=False))
+        .build()
+    )
+    request = (
+        PatchMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(body)
+        .build()
+    )
+    response = _get_client().im.v1.message.patch(request)
+    _ensure_ok(response, "更新卡片")
+    return {"message_id": message_id}
+
+
 def build_task_card(summary: str, task_guid: str, description: str = "") -> dict:
     """构造一张「任务已派发」的通知卡片，配合 send_card 使用。
 
@@ -337,6 +370,89 @@ def create_task(
         raise RuntimeError("创建任务成功但响应缺少 task.guid")
     log.info("飞书任务已创建 guid=%s summary=%s", guid, summary)
     return guid
+
+
+def upload_task_attachment(task_guid: str, filename: str, content: bytes) -> dict:
+    """上传附件到指定飞书任务，返回 guid / url / file_token。
+
+    需要权限：task:task:write
+    """
+    if not task_guid:
+        raise ValueError("task_guid 不能为空")
+    if not filename:
+        raise ValueError("filename 不能为空")
+
+    attachment = (
+        InputAttachment.builder()
+        .resource_type("task")
+        .resource_id(task_guid)
+        .file((filename, io.BytesIO(content), "text/markdown"))
+        .build()
+    )
+    request = (
+        UploadAttachmentRequest.builder()
+        .user_id_type("open_id")
+        .request_body(attachment)
+        .build()
+    )
+    response = _get_client().task.v2.attachment.upload(request)
+    _ensure_ok(response, "上传任务附件")
+
+    items = getattr(response.data, "items", None) or []
+    if not items:
+        raise RuntimeError("上传任务附件成功但响应缺少附件信息")
+    item = items[0]
+    url = item.url or _fetch_attachment_url(item.guid)
+    log.info("任务附件已上传 task=%s guid=%s name=%s", task_guid, item.guid, item.name)
+    return {
+        "guid": item.guid,
+        "url": url,
+        "file_token": item.file_token,
+        "name": item.name,
+    }
+
+
+def _fetch_attachment_url(attachment_guid: str) -> str | None:
+    """上传响应不带 url 时，按 GUID 再查一次附件详情。"""
+    if not attachment_guid:
+        return None
+    try:
+        request = (
+            GetAttachmentRequest.builder()
+            .attachment_guid(attachment_guid)
+            .user_id_type("open_id")
+            .build()
+        )
+        response = _get_client().task.v2.attachment.get(request)
+        if not response.success():
+            log.warning("查询附件详情失败 guid=%s code=%s", attachment_guid, response.code)
+            return None
+        attachment = getattr(response.data, "attachment", None)
+        return getattr(attachment, "url", None)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("查询附件详情异常 guid=%s：%s", attachment_guid, exc)
+        return None
+
+
+def update_task_description(task_guid: str, description: str) -> None:
+    """覆盖式更新任务描述（需传入完整描述文本）。"""
+    if not task_guid:
+        raise ValueError("task_guid 不能为空")
+
+    request = (
+        PatchTaskRequest.builder()
+        .task_guid(task_guid)
+        .user_id_type("open_id")
+        .request_body(
+            PatchTaskRequestBody.builder()
+            .task(InputTask.builder().description(description).build())
+            .update_fields(["description"])
+            .build()
+        )
+        .build()
+    )
+    response = _get_client().task.v2.task.patch(request)
+    _ensure_ok(response, "更新任务描述")
 
 
 # ---------------------------------------------------------------- 组合场景

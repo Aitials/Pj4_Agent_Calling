@@ -64,13 +64,18 @@ def next_assignee() -> dict | None:
         conn.close()
 
 
-def enqueue_notice(notice: dict) -> int | None:
-    """写入通知队列；(record_id, assignee) 冲突时不重复写入。"""
+def enqueue_notice(notice: dict, conn=None) -> int | None:
+    """写入通知队列，返回新建的 notice_id。
+
+    唯一键是 trigger_record_id（一通电话一条）；已存在时返回 None。
+    传入 conn 时复用调用方事务，不提交也不关闭。
+    """
     sql = """
     INSERT INTO `dispatch_notice`
       (`credit_code`, `company_name`, `trigger_record_id`, `trigger_phone`,
-       `assignee_open_id`, `assignee_name`, `trigger_source`, `status`, `notice_date`)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, 'PENDING', %s)
+       `assignee_open_id`, `assignee_name`, `trigger_source`, `status`,
+       `analysis_status`, `notice_date`)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, 'PENDING', 'PENDING', %s)
     ON DUPLICATE KEY UPDATE `id` = LAST_INSERT_ID(`id`)
     """
     values = (
@@ -83,19 +88,26 @@ def enqueue_notice(notice: dict) -> int | None:
         notice.get("trigger_source") or "SUPPLIER",
         notice.get("notice_date") or date.today(),
     )
-    conn = connect()
+    own_conn = conn is None
+    conn = conn or connect()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, values)
             notice_id = cur.lastrowid
-        conn.commit()
+            created = cur.rowcount == 1
+        if own_conn:
+            conn.commit()
+        if not created:
+            return None
         return int(notice_id) if notice_id else None
     except pymysql.MySQLError as exc:
-        conn.rollback()
+        if own_conn:
+            conn.rollback()
         log.error("写入 dispatch_notice 失败：%s", exc)
         raise
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def claim_pending(limit: int = 20) -> list[dict]:
@@ -171,12 +183,17 @@ def mark_failed(
     next_retry_at: datetime | None,
     task_guid: str | None = None,
 ) -> None:
+    """失败回写：还有重试机会就回到 PENDING，否则置 FAILED。
+
+    之前固定写 FAILED，而 claim_pending 只扫 PENDING，导致自动重试永远不生效。
+    """
+    status = "PENDING" if next_retry_at else "FAILED"
     _update(
         "UPDATE `dispatch_notice` "
-        "SET `status` = 'FAILED', `error_msg` = %s, `retry_count` = %s, "
+        "SET `status` = %s, `error_msg` = %s, `retry_count` = %s, "
         "    `next_retry_at` = %s, `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`) "
         "WHERE `id` = %s",
-        (error_msg[:512], int(retry_count), next_retry_at, task_guid, int(notice_id)),
+        (status, error_msg[:512], int(retry_count), next_retry_at, task_guid, int(notice_id)),
     )
 
 
@@ -198,6 +215,223 @@ def reset_failed() -> int:
         raise
     finally:
         conn.close()
+
+
+def claim_analysis_pending(limit: int = 20, max_retry: int = 3) -> list[dict]:
+    """抢占待发送的分析结果通知（基础通知必须已 SENT）。"""
+    limit = max(1, min(int(limit or 20), 100))
+    max_retry = max(1, int(max_retry or 3))
+    conn = connect()
+    try:
+        conn.begin()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM `dispatch_notice` "
+                "WHERE `analysis_status` = 'PENDING' "
+                "  AND `status` = 'SENT' "
+                "  AND `analysis_retry_count` < %s "
+                "ORDER BY `id` LIMIT %s FOR UPDATE SKIP LOCKED",
+                (max_retry, limit),
+            )
+            rows = list(cur.fetchall())
+            if rows:
+                ids = [row["id"] for row in rows]
+                placeholders = ", ".join(["%s"] * len(ids))
+                cur.execute(
+                    f"UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING' "
+                    f"WHERE `id` IN ({placeholders})",
+                    tuple(ids),
+                )
+        conn.commit()
+        return rows
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reclaim_analysis_sending(minutes: int = 10) -> int:
+    """把长时间停留在 SENDING 的分析通知放回 PENDING。"""
+    minutes = max(1, int(minutes or 10))
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE `dispatch_notice` SET `analysis_status` = 'PENDING' "
+                f"WHERE `analysis_status` = 'SENDING' "
+                f"  AND `updated_at` < NOW() - INTERVAL {minutes} MINUTE"
+            )
+            affected = cur.rowcount
+        conn.commit()
+        return affected
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def mark_analysis_pending(record_id: str) -> None:
+    """分析完成后把对应通知置为待发送；已发送的不回退。"""
+    record_id = (record_id or "").strip()
+    if not record_id:
+        return
+    _update(
+        "UPDATE `dispatch_notice` SET `analysis_status` = 'PENDING' "
+        "WHERE `trigger_record_id` = %s AND `analysis_status` IS NULL",
+        (record_id,),
+    )
+
+
+def mark_analysis_sending(notice_id: int) -> None:
+    _update(
+        "UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING' WHERE `id` = %s",
+        (int(notice_id),),
+    )
+
+
+def mark_analysis_sent(notice_id: int, card_message_id: str | None = None) -> None:
+    if card_message_id:
+        _update(
+            "UPDATE `dispatch_notice` "
+            "SET `analysis_status` = 'SENT', `card_message_id` = %s, `updated_at` = NOW() "
+            "WHERE `id` = %s",
+            (card_message_id, int(notice_id)),
+        )
+        return
+    _update(
+        "UPDATE `dispatch_notice` "
+        "SET `analysis_status` = 'SENT', `updated_at` = NOW() WHERE `id` = %s",
+        (int(notice_id),),
+    )
+
+
+def mark_analysis_failed(
+    notice_id: int,
+    error_msg: str,
+    retry_count: int,
+    max_retry: int = 3,
+) -> None:
+    """分析通知失败：未超限回到 PENDING，超限置 FAILED。"""
+    status = "PENDING" if int(retry_count) < max(1, int(max_retry)) else "FAILED"
+    _update(
+        "UPDATE `dispatch_notice` "
+        "SET `analysis_status` = %s, `analysis_retry_count` = %s, `error_msg` = %s "
+        "WHERE `id` = %s",
+        (status, int(retry_count), str(error_msg)[:512], int(notice_id)),
+    )
+
+
+def mark_attachment_pending(notice_id: int) -> None:
+    _update(
+        "UPDATE `dispatch_notice` SET `attachment_status` = 'PENDING', "
+        "  `attachment_updated_at` = NOW() WHERE `id` = %s",
+        (int(notice_id),),
+    )
+
+
+def mark_attachment_skipped(notice_id: int, reason: str = "") -> None:
+    _update(
+        "UPDATE `dispatch_notice` SET `attachment_status` = 'SKIPPED', "
+        "  `attachment_error` = %s, `attachment_updated_at` = NOW() WHERE `id` = %s",
+        (str(reason)[:512] or None, int(notice_id)),
+    )
+
+
+def claim_attachment_pending(limit: int = 10, max_retry: int = 3) -> list[dict]:
+    """抢占待上传附件的通知；要求卡片已发送且飞书任务已创建。"""
+    limit = max(1, min(int(limit or 10), 100))
+    max_retry = max(1, int(max_retry or 3))
+    conn = connect()
+    try:
+        conn.begin()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM `dispatch_notice` "
+                "WHERE `attachment_status` IN ('PENDING', 'FAILED') "
+                "  AND `attachment_retry_count` < %s "
+                "  AND `analysis_status` = 'SENT' "
+                "  AND `feishu_task_guid` IS NOT NULL "
+                "ORDER BY `id` LIMIT %s FOR UPDATE SKIP LOCKED",
+                (max_retry, limit),
+            )
+            rows = list(cur.fetchall())
+            if rows:
+                ids = [row["id"] for row in rows]
+                placeholders = ", ".join(["%s"] * len(ids))
+                cur.execute(
+                    "UPDATE `dispatch_notice` SET `attachment_status` = 'UPLOADING', "
+                    "  `attachment_updated_at` = NOW() "
+                    f"WHERE `id` IN ({placeholders})",
+                    tuple(ids),
+                )
+        conn.commit()
+        return rows
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reclaim_attachment_uploading(minutes: int = 10) -> int:
+    """把长时间停留在 UPLOADING 的附件任务放回 PENDING。"""
+    minutes = max(1, int(minutes or 10))
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE `dispatch_notice` SET `attachment_status` = 'PENDING' "
+                "WHERE `attachment_status` = 'UPLOADING' "
+                f"  AND `attachment_updated_at` < NOW() - INTERVAL {minutes} MINUTE"
+            )
+            affected = cur.rowcount
+        conn.commit()
+        return affected
+    except pymysql.MySQLError:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_attachment_guid(
+    notice_id: int,
+    guid: str,
+    url: str | None,
+    local_path: str | None,
+) -> None:
+    """上传成功后立即记录 GUID，后续重试据此跳过重复上传。"""
+    _update(
+        "UPDATE `dispatch_notice` SET `attachment_guid` = %s, `attachment_url` = %s, "
+        "  `attachment_local_path` = %s, `attachment_updated_at` = NOW() WHERE `id` = %s",
+        (guid, url, local_path, int(notice_id)),
+    )
+
+
+def mark_attachment_done(notice_id: int) -> None:
+    _update(
+        "UPDATE `dispatch_notice` SET `attachment_status` = 'DONE', "
+        "  `attachment_error` = NULL, `attachment_updated_at` = NOW() WHERE `id` = %s",
+        (int(notice_id),),
+    )
+
+
+def mark_attachment_failed(
+    notice_id: int,
+    error_msg: str,
+    retry_count: int,
+    max_retry: int = 3,
+) -> None:
+    """附件失败只影响附件状态，卡片状态保持不变。"""
+    status = "FAILED" if int(retry_count) >= max(1, int(max_retry)) else "PENDING"
+    _update(
+        "UPDATE `dispatch_notice` SET `attachment_status` = %s, "
+        "  `attachment_retry_count` = %s, `attachment_error` = %s, "
+        "  `attachment_updated_at` = NOW() WHERE `id` = %s",
+        (status, int(retry_count), str(error_msg)[:512], int(notice_id)),
+    )
 
 
 def get_notice(notice_id: int) -> dict | None:
