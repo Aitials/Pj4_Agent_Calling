@@ -1,0 +1,182 @@
+# 一次部署包含：MySQL 业务库 + PostgreSQL 记忆库 + Redis 缓存 + 4 个业务进程
+# 常用命令：
+#   docker compose build
+#   docker compose up -d mysql postgres redis
+#   docker compose run --rm init-db          # 首次建表（不插测试数据）
+#   docker compose up -d feishu sync analyzer notifier
+#
+# 说明：
+# - 宿主 .env 通过 env_file 注入，同时被挂载进容器，供一知 Cookie 自动回写
+# - compose 的 environment 优先级高于 env_file；而 python-dotenv 默认不覆盖已有环境变量，
+#   所以宿主的 .env 可以继续保留 127.0.0.1，本地开发不受影响
+# - 业务容器不映射端口；飞书是出站长连接，一知回调本次不部署
+
+name: agent-calling
+
+x-app-base: &app-base
+  build:
+    context: .
+    args:
+      PYTHON_VERSION: ${PYTHON_VERSION:-3.14}
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+  image: agent-calling:${APP_TAG:-latest}
+  env_file:
+    - .env
+  environment:
+    TZ: Asia/Shanghai
+    STATE_DIR: /app/state
+    MYSQL_HOST: mysql
+    MYSQL_PORT: "3306"
+    PG_HOST: postgres
+    PG_PORT: "5432"
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+  volumes:
+    - ./.env:/app/.env
+    - app_state:/app/state
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  # ---------------------------------------------------------------- 中间件
+  mysql:
+    image: mysql:8.0
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中填写 MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_calling}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    # 需要本机客户端连接时再放开，避免和宿主机已有 MySQL 抢 3306
+    # ports:
+    #   - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", 'mysqladmin ping -h 127.0.0.1 -uroot -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  postgres:
+    image: postgres:16
+    environment:
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+      # 应用侧 PG_USER 需保持 postgres（镜像只建这一个超级用户）
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?请在 .env 中填写 PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE:-agent_calling_memory}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${PG_DATABASE:-agent_calling_memory}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      TZ: Asia/Shanghai
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # 有密码就要求鉴权，没密码则直接启动；缓存不可用时应用会自动降级
+    command:
+      - sh
+      - -c
+      - if [ -n "$$REDIS_PASSWORD" ]; then exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"; else exec redis-server --appendonly yes; fi
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------- 一次性初始化
+  # 建库 + 建表；--no-seed 跳过 3 家测试企业，生产库保持干净
+  # 注意：MySQL 表名/库名在 SQL 里写死为 agent_calling，MYSQL_DATABASE 请勿改成其他值
+  init-db:
+    <<: *app-base
+    command: ["python", "sql/000_init_db.py", "--no-seed"]
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- 常驻业务进程
+  feishu:
+    <<: *app-base
+    command: ["python", "run_feishu.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  sync:
+    <<: *app-base
+    command: ["python", "scripts/run_sync.py", "--interval", "60"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  analyzer:
+    <<: *app-base
+    command: ["python", "scripts/run_analyzer.py", "--interval", "10"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  notifier:
+    <<: *app-base
+    command: ["python", "scripts/run_notifier.py", "--interval", "5"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  pg_data:
+  redis_data:
+  app_state:

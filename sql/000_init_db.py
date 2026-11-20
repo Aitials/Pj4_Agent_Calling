@@ -267,6 +267,10 @@ def main() -> int:
         "--recreate", action="store_true",
         help="先删除已存在的业务表再重建（旧数据不保留，测试数据重新插入）",
     )
+    parser.add_argument(
+        "--no-seed", action="store_true",
+        help="只建表，不插入 3 家测试企业数据（生产部署用）",
+    )
     args = parser.parse_args()
 
     database = get_env("MYSQL_DATABASE").strip() or "agent_calling"
@@ -319,11 +323,14 @@ def main() -> int:
                         print(f"[{idx}/{total}] {path.name} → 表 {table}{tag} {state}")
 
         # 4. 插入测试数据（按唯一键 upsert，可重复执行）
-        print(f"\n=== 插入测试数据（{len(SEED_SECTIONS)} 段） ===")
-        for table, label, sql in SEED_SECTIONS:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-            print(f"✓ 测试数据 {table}（{label}）写入完成")
+        if args.no_seed:
+            print("\n=== 已跳过测试数据（--no-seed） ===")
+        else:
+            print(f"\n=== 插入测试数据（{len(SEED_SECTIONS)} 段） ===")
+            for table, label, sql in SEED_SECTIONS:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                print(f"✓ 测试数据 {table}（{label}）写入完成")
         conn.commit()
 
         # 5. 汇总
