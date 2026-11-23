@@ -32,7 +32,7 @@
 | 销售对话短期记忆 | ✅ 完成 | PG checkpoint 按销售（open_id）持久化，重启不丢；最近 10 轮 + token 上限裁剪 |
 | 群聊支持 | ❌ 已关闭 | 只处理单聊，群消息直接忽略；`ALLOW_GROUP_CHAT=true` 可恢复 |
 | 企查查名单导入 | ✅ 脚本可用 | `sql/012_import_qichacha.py`，按统一社会信用代码归并企业 |
-| 一知外呼任务对接 | ✅ 完成 | 登录态自动续期（AES 加密密码 + 失效重登）、线路查询、任务创建/启动、状态查询 |
+| 一知外呼任务对接 | ✅ 完成 | 登录态自动续期（AES 加密密码 + 失效重登）、线路查询、任务创建/启动、状态查询；话术 BOT 取自 `.env` 白名单，不再实时拉取 |
 | 任务运行概况查询 | ✅ 完成 | `query_aicc_task_status`：语义匹配任务 → 筛选卡 → 任务列表卡 → 概况卡（状态/进度/通话效果/意向分布/异常提示），Redis 缓存 60 秒 |
 | 通话与转写回收 | ✅ 完成（轮询） | `run_sync` 定时增量拉取，去重、失败日志、多进程互斥；回调通道代码就绪，公网入口受证书限制 |
 | AI 意向分析 | ✅ 完成 | 9 字段结构化输出（等级/理由/原话/需求/异议/话术），可合并历史通话 |
@@ -114,13 +114,14 @@ PG_SCHEMA=memory
 AICC_PHONE=
 AICC_PASSWORD=
 AICC_COOKIE=                    # 首次可留空，登录成功后自动回写
+AICC_DIALOG_BOTS=               # 新建任务可选的话术 BOT 白名单，格式 123:名称,456:名称
 
 # ===== 飞书（启动 run_feishu.py 才需要）=====
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 ```
 
-可选配置：`HISTORY_MAX_ROUNDS`（默认 10）、`HISTORY_MAX_TOKENS`（默认 6000）、`PG_POOL_MAX`（默认 5）、`ALLOW_GROUP_CHAT`（默认 false）、`AICC_DASHBOARD_TTL`（默认 600）、`AICC_TASK_STATUS_TTL`（默认 60）。
+可选配置：`HISTORY_MAX_ROUNDS`（默认 10）、`HISTORY_MAX_TOKENS`（默认 6000）、`AGENT_RECURSION_LIMIT`（默认 12）、`PG_POOL_MAX`（默认 5）、`ALLOW_GROUP_CHAT`（默认 false）、`AICC_DASHBOARD_TTL`（默认 600）、`AICC_TASK_STATUS_TTL`（默认 60）。
 
 Redis 与一知回调均可暂不配置：Redis 不可用时缓存自动降级（不影响拉取），回调相关变量只在启动 `run_callback.py` 时必填。完整清单见 `.env.example`。
 

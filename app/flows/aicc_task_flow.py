@@ -46,6 +46,14 @@ def _as_bool(value, default: bool = False) -> bool:
 
 
 async def open_create_form(channel, chat_id: str, operator: str, message_id: str = "") -> None:
+    # 话术 BOT 只从 .env 白名单读取，未配置时不发卡，避免用户卡在无法提交的表单上
+    bots = aicc_options.dialog_bot_allowlist()
+    if not bots:
+        await channel.send_text_to_chat(
+            chat_id, "未配置话术 BOT（AICC_DIALOG_BOTS），请联系管理员后再创建任务。"
+        )
+        return
+
     token = forms.register(
         kind="create",
         step="step1",
@@ -54,8 +62,7 @@ async def open_create_form(channel, chat_id: str, operator: str, message_id: str
         message_id=message_id,
     )
     lines = await asyncio.to_thread(aicc_options.phone_lines)
-    flows = await asyncio.to_thread(aicc_options.dialog_flows)
-    card = cards.build_create_form_step1(token=token, lines=lines, dialog_flows=flows)
+    card = cards.build_create_form_step1(token=token, lines=lines, bots=bots)
     await channel.send_card_to_chat(chat_id, card)
 
 
@@ -367,6 +374,9 @@ def _parse_step1(form_value: dict) -> dict:
         raise ValueError("任务名称不能为空")
 
     dialog_flow_id = _as_int(form_value.get("dialog_flow_id"), "话术 / BOT")
+    bots = {bot["id"]: bot["name"] for bot in aicc_options.dialog_bot_allowlist()}
+    if dialog_flow_id not in bots:
+        raise ValueError("话术 / BOT 不在允许列表中，请重新选择")
     ids = [int(item) for item in _as_list(form_value.get("phone_number_ids"))]
     if not ids:
         raise ValueError("主叫线路不能为空")
@@ -391,6 +401,7 @@ def _parse_step1(form_value: dict) -> dict:
     return {
         "name": name,
         "dialog_flow_id": dialog_flow_id,
+        "dialog_flow_name": bots[dialog_flow_id],
         "phone_number_ids": ids,
         "concurrency_quota": concurrency,
         "robot_count": robots,
@@ -447,12 +458,17 @@ async def _create_step1(channel, token, form_value, operator, chat_id, message_i
     try:
         params = await asyncio.to_thread(_parse_step1, form_value)
     except ValueError as exc:
+        bots = aicc_options.dialog_bot_allowlist()
+        if not bots:
+            await channel.send_text_to_chat(
+                chat_id, "话术 BOT 配置已变更，请重新发起创建任务。"
+            )
+            return
         lines = await asyncio.to_thread(aicc_options.phone_lines)
-        flows = await asyncio.to_thread(aicc_options.dialog_flows)
         await channel.send_card_to_chat(
             chat_id,
             cards.build_create_form_step1(
-                token=token, lines=lines, dialog_flows=flows, error=str(exc)
+                token=token, lines=lines, bots=bots, error=str(exc)
             ),
         )
         return
@@ -507,7 +523,10 @@ async def _create_step2(channel, token, form_value, operator, chat_id, message_i
 
     fields = [
         ("任务名称", params.get("name")),
-        ("话术 ID", params.get("dialog_flow_id")),
+        (
+            "话术 BOT",
+            f"{params.get('dialog_flow_name') or '-'}（ID {params.get('dialog_flow_id')}）",
+        ),
         ("主叫线路", "、".join(str(item) for item in params.get("phone_number_ids") or [])),
         ("线路类型", params.get("phone_type")),
         ("并发 / BOT", f"{params.get('concurrency_quota')} / {params.get('robot_count')}"),
@@ -537,6 +556,8 @@ async def _create_confirm(channel, token, operator, chat_id) -> None:
         return
     params = dict(record.get("data") or {})
     params.pop("phone_type", None)
+    # 展示用名称不参与一知接口调用
+    params.pop("dialog_flow_name", None)
     log.info("开始创建外呼任务：%s", params.get("name"))
     result = await asyncio.to_thread(aicc_task.create_call_task, **params)
     await channel.send_card_to_chat(

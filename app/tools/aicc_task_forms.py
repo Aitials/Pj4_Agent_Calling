@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 
 from langchain_core.tools import tool
 
 log = logging.getLogger("aicc_task_forms")
+
+# 同一条用户消息只允许发一次表单卡：模型重复调用时直接拒绝，避免刷屏
+_OPEN_GUARD: dict[str, float] = {}
+_OPEN_GUARD_LOCK = threading.Lock()
+_OPEN_GUARD_TTL = 600.0
 
 # 确定性意图校验：不依赖模型自觉，避免「11」这类含糊输入也弹表单
 _CREATE_VERBS = ("创建", "新建", "建一个", "建个", "加一个", "加个", "搭建", "做个")
@@ -31,6 +38,25 @@ def _has_intent(text: str, kind: str) -> bool:
             word in text for word in _TASK_NOUNS
         )
     return any(word in text for word in _START_VERBS)
+
+
+def _guard_key(message) -> str:
+    message_id = str(getattr(message, "message_id", "") or "")
+    if message_id:
+        return message_id
+    return f"{message.user_id}:{(message.text or '')[:50]}"
+
+
+def _claim_open(key: str) -> bool:
+    """首次调用返回 True，同一条消息的重复调用返回 False。"""
+    now = time.monotonic()
+    with _OPEN_GUARD_LOCK:
+        for stale in [k for k, ts in _OPEN_GUARD.items() if now - ts > _OPEN_GUARD_TTL]:
+            _OPEN_GUARD.pop(stale, None)
+        if key in _OPEN_GUARD:
+            return False
+        _OPEN_GUARD[key] = now
+        return True
 
 
 def _open(kind: str) -> str:
@@ -54,6 +80,13 @@ def _open(kind: str) -> str:
     if loop is None:
         return "飞书通道尚未就绪，请稍后重试。"
 
+    if not _claim_open(_guard_key(message)):
+        log.warning("同一消息重复请求发卡，已忽略 user=%s", message.user_id)
+        return (
+            "本消息的表单卡片已发送过，禁止重复发送。"
+            "请立即停止调用任何工具，直接用一句话回复用户，提醒其在卡片中填写并提交。"
+        )
+
     action = "open_create" if kind == "create" else "open_start"
     asyncio.run_coroutine_threadsafe(
         aicc_task_flow.handle_action(
@@ -67,7 +100,10 @@ def _open(kind: str) -> str:
         ),
         loop,
     )
-    return "已发送表单卡片，请让用户在卡片中填写后提交。"
+    return (
+        "表单卡片已发送。请立即停止调用任何工具，"
+        "直接用一句简短的话回复用户，提醒其在卡片中填写并提交。"
+    )
 
 
 @tool

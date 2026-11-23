@@ -40,6 +40,11 @@ ALLOW_GROUP_CHAT = get_env("ALLOW_GROUP_CHAT", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
+# ===== 企业微信智能机器人（第二渠道，长连接）=====
+# 企业微信管理后台 → 智能机器人 → API 模式 → 长连接，页面生成 Bot ID 与 Secret
+WECHAT_BOT_ID = get_env("WECHAT_BOT_ID").strip()
+WECHAT_BOT_SECRET = get_env("WECHAT_BOT_SECRET").strip()
+
 
 @dataclass(frozen=True)
 class Settings:

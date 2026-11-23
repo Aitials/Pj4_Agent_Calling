@@ -14,6 +14,7 @@ from langchain_core.messages import AnyMessage, HumanMessage, trim_messages
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphRecursionError
 
 from app.core.config import Settings, get_env
 from app.tools import ALL_TOOLS
@@ -40,6 +41,8 @@ SYSTEM_PROMPT = (
 # 上下文裁剪：只把最近 N 轮送给模型，再用 token 上限兜底，防止单轮超长
 HISTORY_MAX_ROUNDS = max(1, int(get_env("HISTORY_MAX_ROUNDS", "10").strip() or 10))
 HISTORY_MAX_TOKENS = max(500, int(get_env("HISTORY_MAX_TOKENS", "6000").strip() or 6000))
+# 单轮最多执行步数：防止模型反复调工具刷屏（默认 25 太高）
+AGENT_RECURSION_LIMIT = max(4, int(get_env("AGENT_RECURSION_LIMIT", "12").strip() or 12))
 
 
 def _message_text(content) -> str:
@@ -117,10 +120,11 @@ class _TrimHistoryMiddleware(AgentMiddleware):
         return await handler(self._prepare(request))
 
 
-def _run_config(thread_id: str | None) -> dict | None:
-    if not thread_id:
-        return None
-    return {"configurable": {"thread_id": thread_id}}
+def _run_config(thread_id: str | None) -> dict:
+    config: dict = {"recursion_limit": AGENT_RECURSION_LIMIT}
+    if thread_id:
+        config["configurable"] = {"thread_id": thread_id}
+    return config
 
 
 class BaseAgent:
@@ -162,13 +166,17 @@ class BaseAgent:
 
     async def astream(self, text: str, thread_id: str | None = None):
         """流式产出文本增量，供聊天通道做打字机效果。"""
-        async for event in self.agent.astream_events(
-            {"messages": [{"role": "user", "content": text}]},
-            config=_run_config(thread_id),
-            version="v2",
-        ):
-            if event["event"] != "on_chat_model_stream":
-                continue
-            content = event["data"]["chunk"].content
-            if isinstance(content, str) and content:
-                yield content
+        try:
+            async for event in self.agent.astream_events(
+                {"messages": [{"role": "user", "content": text}]},
+                config=_run_config(thread_id),
+                version="v2",
+            ):
+                if event["event"] != "on_chat_model_stream":
+                    continue
+                content = event["data"]["chunk"].content
+                if isinstance(content, str) and content:
+                    yield content
+        except GraphRecursionError:
+            log.warning("达到递归上限 %d，已中止本轮", AGENT_RECURSION_LIMIT)
+            yield "处理步骤过多，已中止本轮。请换个说法再试一次。"

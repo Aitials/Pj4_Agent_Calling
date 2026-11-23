@@ -11,6 +11,10 @@ langgraph-checkpoint-postgres>=3.2.1
 # ===== 飞书开放平台 =====
 lark-oapi>=1.7.5
 
+# ===== 企业微信智能机器人（第二渠道，长连接）=====
+# 官方 SDK（WecomTeam），运行时自动带入 websockets>=12 / aiohttp>=3.9 / pyee>=11 / cryptography>=42 / certifi
+wecom-aibot-python-sdk==1.0.2
+
 # ===== 数据库 / 缓存 =====
 pymysql>=1.2.0
 psycopg[binary,pool]>=3.3.0

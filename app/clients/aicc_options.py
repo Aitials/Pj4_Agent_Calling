@@ -18,6 +18,7 @@ from typing import Any
 
 from app.clients import tanyibot
 from app.core import cache
+from app.core.config import get_env
 
 log = logging.getLogger("aicc_options")
 
@@ -75,8 +76,36 @@ def phone_lines() -> dict[str, list[dict]]:
         return {}
 
 
+def dialog_bot_allowlist() -> list[dict]:
+    """从 .env 读取允许使用的话术 BOT 白名单。
+
+    格式：AICC_DIALOG_BOTS=123:11月新客回访,456:续费提醒
+    id 用于调用一知接口，name 仅用于卡片展示；本函数不请求一知。
+    """
+    raw = (get_env("AICC_DIALOG_BOTS") or "").strip()
+    if not raw:
+        return []
+
+    bots: list[dict] = []
+    for part in raw.replace("，", ",").replace("：", ":").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        flow_id, _, name = item.partition(":")
+        flow_id = flow_id.strip()
+        if not flow_id.isdigit() or int(flow_id) <= 0:
+            log.warning("话术 BOT 配置格式不合法，已跳过：%s", item)
+            continue
+        bots.append({"id": int(flow_id), "name": name.strip() or f"BOT-{flow_id}"})
+    return bots
+
+
 def dialog_flows() -> list[dict]:
-    """话术/BOT 列表：id 即创建任务用的 dialogFlowId。"""
+    """话术/BOT 列表：id 即创建任务用的 dialogFlowId。
+
+    已封存：创建任务改为读取 .env 白名单（见 dialog_bot_allowlist），
+    本函数保留备查，不再被创建流程调用。
+    """
     return _options(
         "aicc:opts:dialog_flows",
         lambda: [

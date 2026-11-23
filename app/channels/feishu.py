@@ -258,6 +258,13 @@ class FeishuChannel(Channel):
                 continue
             if not message:
                 continue
+            handle = message.reply_handle if isinstance(message.reply_handle, dict) else {}
+            if handle.get("unsupported"):
+                try:
+                    await self.reply_text(message, "目前仅支持文字消息，请用文字描述。")
+                except Exception:
+                    log.exception("发送不支持消息类型提示失败")
+                continue
             # 临时调试：/cardtest 发一张按钮卡片，用于验证「发卡 → 点按钮 → 收回调」通路
             if message.text.strip().lower() == CARD_TEST_COMMAND:
                 try:
@@ -542,6 +549,28 @@ class FeishuChannel(Channel):
             )
             return None
 
+        chat_id = str(message.chat_id or "")
+        message_type = str(message.message_type or "")
+        message_id = str(message.message_id or "")
+        reply_handle = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "chat_type": chat_type,
+            "message_type": message_type,
+        }
+
+        # 当前只支持纯文字：其他类型不再下载媒体，交由队列循环统一提示
+        if message_type != "text":
+            return IncomingMessage(
+                channel=self.name,
+                message_id=message_id,
+                user_id=user_id,
+                conversation_id=user_id,
+                text="",
+                raw=message,
+                reply_handle={**reply_handle, "unsupported": True},
+            )
+
         try:
             content = json.loads(message.content or "{}")
         except json.JSONDecodeError:
@@ -550,73 +579,18 @@ class FeishuChannel(Channel):
         if not isinstance(content, dict):
             return None
 
-        texts: list[str] = []
-        media: list[MediaAttachment] = []
-        message_type = str(message.message_type or "")
-        message_id = str(message.message_id or "")
-
-        if message_type == "text":
-            texts.append(_clean_text(str(content.get("text") or "")))
-        elif message_type == "post":
-            texts.append(_clean_text(_post_text(content)))
-            for image_key in _post_image_keys(content):
-                attachment = await self._download_media(
-                    message_id, image_key, "image", "image", ""
-                )
-                if attachment:
-                    media.append(attachment)
-        elif message_type in _MEDIA_KINDS:
-            kind = _MEDIA_KINDS[message_type]
-            raw_key = (
-                content.get("image_key")
-                if message_type == "image"
-                else content.get("file_key")
-            )
-            key = str(raw_key or "")
-            file_name = str(content.get("file_name") or "")
-            resource_type = "image" if message_type == "image" else "file"
-            if key:
-                attachment = await self._download_media(
-                    message_id, key, kind, resource_type, file_name
-                )
-                if attachment:
-                    media.append(attachment)
-        elif message_type in ("sticker", "interactive", "share_chat", "share_user", "system"):
-            texts.append(f"[{message_type}] 暂不支持解析该类型消息")
-        else:
-            texts.append(f"[{message_type}] 暂不支持解析该类型消息")
-
-        text = "\n".join(part for part in texts if part).strip()
-        if media:
-            notes = []
-            for attachment in media:
-                if attachment.path:
-                    notes.append(f"[{attachment.kind}] 已保存到本地：{attachment.path}")
-                else:
-                    notes.append(f"[{attachment.kind}] 下载失败，详见日志")
-            text = f"{text}\n\n{chr(10).join(notes)}" if text else "\n".join(notes)
-
+        text = _clean_text(str(content.get("text") or "")).strip()
         if not text:
             return None
-
-        chat_id = str(message.chat_id or "")
-        # 群聊已关闭：记忆统一按发送人隔离，thread_id = open_id
-        conversation_id = user_id
 
         return IncomingMessage(
             channel=self.name,
             message_id=message_id,
             user_id=user_id,
-            conversation_id=conversation_id,
+            conversation_id=user_id,
             text=text,
-            media=media,
             raw=message,
-            reply_handle={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "chat_type": chat_type,
-                "message_type": message_type,
-            },
+            reply_handle=reply_handle,
         )
 
     async def _download_media(

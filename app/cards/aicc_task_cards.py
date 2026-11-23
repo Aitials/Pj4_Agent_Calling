@@ -172,7 +172,7 @@ def build_create_form_step1(
     *,
     token: str,
     lines: dict[str, list[dict]],
-    dialog_flows: list[dict],
+    bots: list[dict],
     error: str = "",
 ) -> dict:
     """创建任务第一步：必填项。"""
@@ -181,15 +181,12 @@ def build_create_form_step1(
         elements.append(_error_line(error))
 
     line_options = _line_options(lines)
-    flow_options = _named_options(dialog_flows, with_status=True)
+    # 话术 BOT 只来自 .env 白名单，恒为必选下拉，不提供手填入口
+    flow_options = [_option(str(bot.get("name") or bot.get("id")), bot.get("id")) for bot in bots]
 
     form_elements: list[dict] = [
         _input("name", "任务名称", required=True, placeholder="例如：11月新客回访", max_length=50),
-        (
-            _select("dialog_flow_id", "话术 / BOT", flow_options, required=True, placeholder="请选择话术")
-            if flow_options
-            else _input("dialog_flow_id", "话术 / BOT ID", required=True, placeholder="选项加载失败，请手填话术 ID")
-        ),
+        _select("dialog_flow_id", "话术 / BOT", flow_options, required=True, placeholder="请选择话术"),
         (
             _select("phone_number_ids", "主叫线路（可多选）", line_options, required=True, multiple=True)
             if line_options
@@ -219,10 +216,7 @@ def build_create_form_step1(
         }
     )
     elements.append(
-        _columns(
-            _callback_button("刷新选项", "task_form_refresh", {"kind": "create"}),
-            _callback_button("取消", "task_form_cancel", {"token": token}),
-        )
+        _columns(_callback_button("取消", "task_form_cancel", {"token": token}))
     )
     return _base_card("创建外呼任务 · 第 1 步（必填）", elements)
 
@@ -246,7 +240,7 @@ def build_create_form_step2(
         _markdown(
             "第 1 步参数已校验通过：\n"
             f"- 任务名：{params.get('name')}\n"
-            f"- 话术 ID：{params.get('dialog_flow_id')}\n"
+            f"- 话术：{params.get('dialog_flow_name') or '-'}（ID {params.get('dialog_flow_id')}）\n"
             f"- 线路：{'、'.join(str(item) for item in params.get('phone_number_ids') or [])}\n"
             f"- 并发 / BOT：{params.get('concurrency_quota')} / {params.get('robot_count')}\n"
             f"- 时段：{params.get('daily_start_time')} - {params.get('daily_end_time')}\n"
