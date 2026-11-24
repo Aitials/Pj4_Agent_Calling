@@ -24,6 +24,12 @@ def main() -> None:
     if not wecom_api.is_configured():
         raise SystemExit("缺少 WECHAT_BOT_ID / WECHAT_BOT_SECRET，请先在 .env 中配置")
 
+    if not wecom_api.is_identity_configured():
+        log.warning(
+            "未配置 WECHAT_CORP_ID / WECHAT_AGENT_SECRET，"
+            "企微身份将使用原始 open_userid（记忆可用但不可读）"
+        )
+
     # 提前校验模型与记忆库配置，避免长连接建立后才发现缺配置
     try:
         Settings.load()

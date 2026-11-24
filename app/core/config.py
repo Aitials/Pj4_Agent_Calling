@@ -44,6 +44,10 @@ ALLOW_GROUP_CHAT = get_env("ALLOW_GROUP_CHAT", "false").strip().lower() in (
 # 企业微信管理后台 → 智能机器人 → API 模式 → 长连接，页面生成 Bot ID 与 Secret
 WECHAT_BOT_ID = get_env("WECHAT_BOT_ID").strip()
 WECHAT_BOT_SECRET = get_env("WECHAT_BOT_SECRET").strip()
+# 自建应用凭证：换取 access_token（open_userid 转明文 userid；通讯录/待办后续也用它）
+WECHAT_CORP_ID = get_env("WECHAT_CORP_ID").strip()
+WECHAT_AGENT_ID = get_env("WECHAT_AGENT_ID").strip()
+WECHAT_AGENT_SECRET = get_env("WECHAT_AGENT_SECRET").strip()
 
 
 @dataclass(frozen=True)

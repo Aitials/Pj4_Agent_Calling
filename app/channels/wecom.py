@@ -1,7 +1,9 @@
-"""企业微信智能机器人通道（当前阶段：文本对话 + 流式输出）。
+"""企业微信智能机器人通道（当前阶段：文本对话 + 流式输出 + 身份解析）。
 
 长连接模式下，收到 aibot_msg_callback 后用同一帧的 req_id 回复；
 流式回复通过同一个 stream_id 反复推送，最后以 finish=True 收尾。
+发送人 ID 先经 wecom_api.resolve_userid 解析成明文 userid，
+会话标识（thread_id）直接取解析结果，按工号隔离记忆。
 飞书通道保持独立，两者互不影响。
 """
 
@@ -73,14 +75,14 @@ class WecomChannel(Channel):
                 log.info("重复消息已忽略 msgid=%s", msgid)
                 return
 
-            user_id = _sender_userid(body)
+            user_id = await self._resolve_user(_sender_userid(body))
             if not user_id:
                 log.warning("企微消息缺少发送人，已忽略 frame=%s", str(frame)[:300])
                 return
 
             text, prompt = self._extract_text(body, msgtype)
             if prompt:
-                await self._reply_prompt(frame, body, prompt)
+                await self._reply_prompt(frame, prompt, user_id)
                 return
             if not text:
                 return
@@ -89,7 +91,9 @@ class WecomChannel(Channel):
                 channel=self.name,
                 message_id=msgid,
                 user_id=user_id,
-                conversation_id=str(body.get("chatid") or user_id),
+                # 单聊下 chatid 未必等于 userid，直接收敛到解析后的身份，
+                # 保证 router 的 thread_id 就是（转明文后的）userid
+                conversation_id=user_id,
                 text=text,
                 raw=frame,
                 reply_handle=frame,
@@ -116,7 +120,7 @@ class WecomChannel(Channel):
             return "", ""
         return "", "暂不支持该类型消息，请发送文字。"
 
-    async def _reply_prompt(self, frame: dict, body: dict, text: str) -> None:
+    async def _reply_prompt(self, frame: dict, text: str, user_id: str) -> None:
         """用同一帧回一条提示；失败时降级为主动推送。"""
         client = self._client
         if client is None:
@@ -127,13 +131,23 @@ class WecomChannel(Channel):
         except Exception:  # noqa: BLE001
             log.exception("企微提示回复失败，尝试主动推送")
 
-        chat_id = str(body.get("chatid") or _sender_userid(body))
-        if not chat_id:
+        if not user_id:
             return
         try:
-            await self.send_text_to_chat(chat_id, text)
+            await self.send_text_to_chat(user_id, text)
         except Exception:  # noqa: BLE001
             log.exception("企微主动推送提示也失败")
+
+    @staticmethod
+    async def _resolve_user(raw_user: str) -> str:
+        """解析发送人身份；任何异常都退回原始 ID，保证消息不丢。"""
+        if not raw_user:
+            return ""
+        try:
+            return await asyncio.to_thread(wecom_api.resolve_userid, raw_user)
+        except Exception:  # noqa: BLE001
+            log.exception("解析企微身份失败，使用原始 ID user=%s", raw_user)
+            return raw_user
 
     def _is_duplicate(self, msgid: str) -> bool:
         now = time.monotonic()
