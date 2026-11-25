@@ -195,16 +195,18 @@ def _render_jobs(robots: dict, jobs: list[dict]) -> list[str]:
     return lines
 
 
-@tool
+@tool(parse_docstring=True)
 def query_aicc_dashboard(start_date: str = "", end_date: str = "") -> str:
-    """查询一知 AI 外呼首页看板：核心 KPI、意向分布、每日趋势、AI 机器人与运行中任务。
+    """查询一知外呼首页看板：核心 KPI、意向分布、每日趋势、AI 机器人与运行中任务（只读）。
+
+    何时使用：用户问整体外呼情况，如「今天外呼怎么样」「近 7 天接通率」「现在几个任务在跑」。
+    不要使用：问某个具体任务的进度/意向（用 query_aicc_task_status）；问客户资料（用 query_customer_profile）。
+    副作用：无。只读平台接口，结果缓存 10 分钟，同一时间段重复提问不会重复请求。
+    返回：文本报表；时间段无数据时指标为 0 是真实值。
 
     Args:
         start_date: 开始日期，格式 YYYY-MM-DD；留空表示今天。
-        end_date: 结束日期，格式 YYYY-MM-DD；留空表示今天。
-
-    用于回答「今天外呼情况怎么样」「近 7 天接通率如何」「现在有几个任务在跑」这类问题。
-    数据来自平台实时接口，结果会缓存 10 分钟，因此同一时间段内重复提问不会重复请求。
+        end_date: 结束日期，格式 YYYY-MM-DD；留空表示今天。起止顺序颠倒会自动纠正。
     """
     today = date.today()
     try:

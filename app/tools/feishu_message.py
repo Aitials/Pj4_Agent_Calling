@@ -33,15 +33,18 @@ def _render_members(rows: list[dict], title: str) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(parse_docstring=True)
 def find_feishu_member(name: str = "", department: str = "") -> str:
-    """查询飞书通讯录成员，返回姓名、部门和 open_id。
+    """在本地通讯录中按姓名查找飞书成员，返回姓名、部门与 open_id（只读）。
+
+    何时使用：需要确认收件人是谁、获取 open_id，或在发消息/派任务前核对重名。
+    不要使用：查客户档案（用 query_customer_profile）。
+    副作用：无，只读本地通讯录，不会访问飞书。
+    返回：唯一命中返回详情；多个命中返回候选列表；未命中给出提示。
 
     Args:
-        name: 姓名关键词，支持部分匹配，如「张三」或「张」。
-        department: 部门名称关键词，用于缩小范围。当前部门信息尚未同步，传了会被忽略。
-
-    命中一个返回详情，命中多个返回列表，未命中给出明确提示。
+        name: 姓名关键词，支持部分匹配，如「张三」或「张」；为空时无法查询。
+        department: 部门名称关键词，用于缩小范围；当前部门信息尚未同步，传了会被忽略。
     """
     name = (name or "").strip()
     department = (department or "").strip()
@@ -77,15 +80,19 @@ def find_feishu_member(name: str = "", department: str = "") -> str:
     return _render_members(rows, f"找到 {len(rows)} 个匹配「{name}」的成员，请确认是哪一个：") + note
 
 
-@tool
+@tool(parse_docstring=True)
 def send_feishu_message(receiver: str, content: str) -> str:
-    """向飞书成员发送一条文本消息。
+    """向飞书成员发送一条文本私信（真实发送，本工具无法撤回）。
+
+    何时使用：用户明确要求把某段内容发给某个人。
+    不要使用：用户只是让你起草或展示内容；收件人不明确、重名或只是提了一句人名时，
+              先确认再发送，不要猜收件人。
+    副作用：会真实发送飞书私信，对收件人立即可见；失败时返回原因。
+    返回：成功返回收件人与 message_id；重名时返回候选列表且不发送。
 
     Args:
-        receiver: 收件人。可以是姓名（如「张三」），也可以是 open_id（如「ou_xxx」）。
-        content: 消息正文，纯文本。
-
-    姓名不唯一时不会发送，会返回候选列表，需补充更精确的姓名或改用 open_id。
+        receiver: 收件人，必填。可以是姓名（如「张三」）或 open_id（如「ou_xxx」）。
+        content: 消息正文，必填。纯文本，不能为空。
     """
     receiver = (receiver or "").strip()
     content = (content or "").strip()

@@ -50,24 +50,27 @@ def _parse_due(due_str: str | None) -> int | None:
     return None
 
 
-@tool
+@tool(parse_docstring=True)
 def create_feishu_task(
     summary: str,
     assignee: str,
     description: str = "",
     due: str = "",
 ) -> str:
-    """创建一个飞书任务并派发负责人，同时发送卡片通知。
+    """创建飞书任务并派发给负责人，同时发送卡片通知（真实写入）。
+
+    何时使用：用户明确要求给某个人建任务/待办，并说明了要做什么。
+    不要使用：只是发消息（用 send_feishu_message）、只是提醒、或负责人不明确；
+              重名时先确认，不要猜人。
+    副作用：会在飞书创建真实任务，并向负责人发送卡片通知；
+            卡片失败不影响任务创建，会提示手动通知。
+    返回：任务 GUID 与查看链接；重名时不创建任务，返回候选列表。
 
     Args:
-        summary: 任务标题，简明描述要做什么，必填。
-        assignee: 负责人。可以是姓名（如「张三」）或 open_id（如「ou_xxx」）。
-        description: 任务详情、要求、备注等，可选。
-        due: 截止时间，可选。格式为「YYYY-MM-DD HH:MM」或「YYYY-MM-DD」，例如「2026-11-14 18:00」。
-             不传则无截止时间。
-
-    重名时不会创建任务，会返回候选列表以避免派错人。
-    创建成功会同时向负责人发送飞书卡片通知。
+        summary: 任务标题，必填。简明描述要做什么。
+        assignee: 负责人，必填。姓名（如「张三」）或 open_id（如「ou_xxx」）。
+        description: 任务详情/要求/备注，可选。
+        due: 截止时间，可选。格式「YYYY-MM-DD HH:MM」或「YYYY-MM-DD」；不传表示无截止时间。
     """
     summary = (summary or "").strip()
     assignee = (assignee or "").strip()
