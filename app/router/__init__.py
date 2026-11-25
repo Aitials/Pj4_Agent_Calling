@@ -111,7 +111,11 @@ def create_channel(name: str) -> Channel:
         from app.channels.wecom import WecomChannel
 
         return WecomChannel()
-    raise SystemExit(f"未知通道：{name}（当前支持 feishu / wecom）")
+    if name == "dingtalk":
+        from app.channels.dingtalk import DingtalkChannel
+
+        return DingtalkChannel()
+    raise SystemExit(f"未知通道：{name}（当前支持 feishu / wecom / dingtalk）")
 
 
 async def run_channel(name: str) -> None:

@@ -15,6 +15,12 @@ lark-oapi>=1.7.5
 # 官方 SDK（WecomTeam），运行时自动带入 websockets>=12 / aiohttp>=3.9 / pyee>=11 / cryptography>=42 / certifi
 wecom-aibot-python-sdk==1.0.2
 
+# ===== 钉钉企业内部应用（第三渠道，Stream 模式）=====
+# 官方 Stream SDK：长连接收机器人消息，免公网回调 / 免 AES 加解密
+dingtalk-stream>=0.24.3
+# 新版服务端 SDK（可选）：本项目走 httpx 直调 OpenAPI，仅在需要类型化调用时使用
+alibabacloud-dingtalk>=2.2.67
+
 # ===== 数据库 / 缓存 =====
 pymysql>=1.2.0
 psycopg[binary,pool]>=3.3.0

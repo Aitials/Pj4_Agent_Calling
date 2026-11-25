@@ -3,11 +3,12 @@
 venv/
 __pycache__/
 *.py[cod]
-.idea/
-.idea/workspace.xml
+.idea/*
+!.idea/vcs.xml
 state/
 .workbuddy/
 .screenshots/
-
+.idea/vcs.xml
 AI messages/
 /初步验收报告.md
+/钉钉渠道开发计划.md

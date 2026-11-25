@@ -49,6 +49,17 @@ WECHAT_CORP_ID = get_env("WECHAT_CORP_ID").strip()
 WECHAT_AGENT_ID = get_env("WECHAT_AGENT_ID").strip()
 WECHAT_AGENT_SECRET = get_env("WECHAT_AGENT_SECRET").strip()
 
+# ===== 钉钉企业内部应用（第三渠道，机器人 Stream 模式）=====
+# 开发者后台 → 基础信息 → 凭证与基础信息：Client ID（旧称 AppKey）/ Client Secret
+DINGTALK_CLIENT_ID = get_env("DINGTALK_CLIENT_ID").strip()
+DINGTALK_CLIENT_SECRET = get_env("DINGTALK_CLIENT_SECRET").strip()
+# 组织 corpId：本期无 H5 免登可留空
+DINGTALK_CORP_ID = get_env("DINGTALK_CORP_ID").strip()
+# 应用能力 → 机器人 → 机器人 ID：主动发单聊/群聊消息时的 robotCode
+DINGTALK_ROBOT_CODE = get_env("DINGTALK_ROBOT_CODE").strip()
+# 应用标识，预留（Stream 收发不依赖）
+DINGTALK_AGENT_ID = get_env("DINGTALK_AGENT_ID").strip()
+
 
 @dataclass(frozen=True)
 class Settings:
