@@ -31,7 +31,6 @@ def persist_record(
         return {"saved": False, "notice_id": None}
 
     credit_code = record.get("credit_code")
-    assignee = None
     trigger_source = "SUPPLIER"
 
     # 派单硬闸门：空号/拒接/黑名单/勿扰不通知销售，但通话记录仍要入库留档
@@ -41,19 +40,17 @@ def persist_record(
     if block_reason:
         log.info("通话 %s 命中阻断(%s)，跳过派单", record_id, block_reason)
 
+    should_notify = False
     if notify and not block_reason:
         should_notify, _rule = intent.evaluate(record)
-        if should_notify and credit_code:
-            # 已入队过就不再轮转销售，避免同一通话分配到不同人
-            if dispatch_repo.get_notice_by_record(record_id):
-                log.info("通话 %s 已存在通知记录，跳过派单", record_id)
-            else:
-                assignee = dispatch_repo.next_assignee()
-                if not assignee:
-                    log.warning("销售名单为空，通话 %s 无法派单", record_id)
+        should_notify = bool(should_notify and credit_code)
+
+    # 企业名称在事务外读取：它只读、且不属于本次入库要修改的行
+    company_name = customer_repo.get_company_name(credit_code) if should_notify else None
 
     conn = customer_repo.connect()
     notice_id: int | None = None
+    assignee = None
     try:
         conn.begin()
         call_record_repo.upsert_call_record(record, conn=conn)
@@ -64,10 +61,19 @@ def persist_record(
                 record.get("customer_phone"), writeback_reason, conn=conn
             )
 
+        if should_notify:
+            # 判重与轮转必须在同一事务内：否则「游标已提交、入队失败」会让分配与记录不一致
+            if dispatch_repo.get_notice_by_record(record_id, conn=conn, for_update=True):
+                log.info("通话 %s 已存在通知记录，跳过派单", record_id)
+            else:
+                assignee = dispatch_repo.next_assignee(conn=conn)
+                if not assignee:
+                    log.warning("销售名单为空，通话 %s 无法派单", record_id)
+
         if assignee:
             notice = {
                 "credit_code": credit_code,
-                "company_name": customer_repo.get_company_name(credit_code),
+                "company_name": company_name,
                 "trigger_record_id": record_id,
                 "trigger_phone": record.get("customer_phone"),
                 "assignee_open_id": assignee["open_id"],

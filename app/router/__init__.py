@@ -25,12 +25,15 @@ def setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def init_agent() -> BaseAgent:
-    """初始化 Agent：连 PG checkpoint 连接池，全进程复用一个实例。"""
+async def init_agent(channel: str = "") -> BaseAgent:
+    """初始化 Agent：连 PG checkpoint 连接池，全进程复用一个实例。
+
+    channel 决定可用工具集：仅飞书可用的工具不会暴露给其他渠道。
+    """
     global _AGENT
     if _AGENT is None:
         checkpointer = await memory.init_memory()
-        _AGENT = BaseAgent(Settings.load(), checkpointer=checkpointer)
+        _AGENT = BaseAgent(Settings.load(), checkpointer=checkpointer, channel=channel)
     return _AGENT
 
 
@@ -106,22 +109,28 @@ def create_channel(name: str) -> Channel:
     if name == "feishu":
         from app.channels.feishu import FeishuChannel
 
-        return FeishuChannel()
-    if name == "wecom":
+        channel: Channel = FeishuChannel()
+    elif name == "wecom":
         from app.channels.wecom import WecomChannel
 
-        return WecomChannel()
-    if name == "dingtalk":
+        channel = WecomChannel()
+    elif name == "dingtalk":
         from app.channels.dingtalk import DingtalkChannel
 
-        return DingtalkChannel()
-    raise SystemExit(f"未知通道：{name}（当前支持 feishu / wecom / dingtalk）")
+        channel = DingtalkChannel()
+    else:
+        raise SystemExit(f"未知通道：{name}（当前支持 feishu / wecom / dingtalk）")
+
+    from app.channels import register_channel
+
+    register_channel(channel)
+    return channel
 
 
 async def run_channel(name: str) -> None:
     global _AGENT
     channel = create_channel(name)
-    await init_agent()
+    await init_agent(channel.name)
     setter = getattr(channel, "set_form_handler", None)
     if setter is not None:
         setter(partial(handle_task_card_action, channel))

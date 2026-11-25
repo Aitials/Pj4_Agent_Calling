@@ -78,10 +78,20 @@ def update(token: str, *, step: str | None = None, data: dict | None = None) -> 
 
 
 def pop_for(token: str, operator: str = "") -> tuple[dict | None, str]:
-    """取出并作废（用于确认阶段，防重复执行）。"""
-    item, reason = get_for(token, operator)
-    if reason != "ok" or not item:
-        return None, reason
+    """取出并作废（用于确认阶段，防重复执行）。
+
+    校验与删除必须在同一个锁内完成：先 get_for 再 pop 会让两个并发调用
+    都读到 "ok"，从而重复执行创建/启动。
+    """
+    now = time.monotonic()
     with _lock:
+        item = _records.get(token)
+        if not item:
+            return None, "missing"
+        if item["expires_at"] <= now:
+            _records.pop(token, None)
+            return None, "expired"
+        if operator and item["operator"] and operator != item["operator"]:
+            return None, "forbidden"
         _records.pop(token, None)
-    return item, "ok"
+        return dict(item), "ok"

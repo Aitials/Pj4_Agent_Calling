@@ -17,21 +17,22 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 
 from app.core.config import Settings, get_env
-from app.tools import ALL_TOOLS
+from app.tools import ALL_TOOLS, tools_for
 
 log = logging.getLogger("agent")
 
 SYSTEM_PROMPT = (
     "你是一个简洁高效的助手，请用简体中文回答。"
     "按手机号或姓名查某个客户的档案时，调用 query_customer_profile 工具。"
-    "问外呼情况、看板数据、接通率、在跑任务时，调用 query_aicc_dashboard 工具。"
+    "问整体外呼情况、看板数据、接通率、在跑多少任务时，调用 query_aicc_dashboard 工具。"
     "问某个具体任务的运行状态、进度、意向分布时，调用 query_aicc_task_status；"
     "用户提到任务名或任务 ID，就把它作为 task_keyword 传入；没提到具体任务就留空，"
     "工具会先发筛选卡片。不要自己编造任务 ID、状态或进度数据。"
     "只有用户明确说“创建/新建外呼任务”时才调用 open_create_task_form；"
     "只有用户明确说“启动/开始跑某个任务”时才调用 open_start_task_form。"
     "数字、寒暄、追问、上下文不完整等含糊输入，一律不要调用这些工具，先用一句话反问确认。"
-    "严格以用户当前这句话的意图为准，不要根据历史对话揣测。"
+    "历史对话只用于理解指代和补充参数（例如“那就启动它”中的“它”指哪个任务），"
+    "当前这句话决定用户此刻要做的动作；涉及创建/启动等真实操作时必须先发卡片让用户确认。"
     "任务的参数由用户在卡片里填写，你只需要提示用户去填写/确认，"
     "不要声称任务已经创建或启动，也不要自己编造参数。"
     "不要编造客户信息，工具返回的是纯文本，直接转述或复述即可。"
@@ -134,8 +135,12 @@ class BaseAgent:
         self,
         settings: Settings,
         checkpointer: BaseCheckpointSaver | None = None,
+        channel: str = "",
     ) -> None:
         self.settings = settings
+        self.channel = (channel or "").strip().lower()
+        # 只暴露当前渠道真正可用的工具：飞书专属工具不注入其他渠道
+        self.tools = tools_for(self.channel) or ALL_TOOLS
         # ChatOpenAI 兼容写法：任何兼容 OpenAI 协议的服务只需换 base_url / model
         self.llm = ChatOpenAI(
             api_key=settings.llm_api_key,
@@ -145,7 +150,7 @@ class BaseAgent:
         )
         self.agent = create_agent(
             self.llm,
-            tools=ALL_TOOLS,
+            tools=self.tools,
             system_prompt=SYSTEM_PROMPT,
             middleware=[_TrimHistoryMiddleware()],
             checkpointer=checkpointer,

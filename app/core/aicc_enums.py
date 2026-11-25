@@ -26,6 +26,7 @@ TASK_STATUS_LABELS = {
     "SYSTEM_SUSPENDED": "系统暂停",
     "SYSTEM_HANG_UP": "系统挂起",
     "MAINTAIN": "系统维护",
+    "ACCOUNT_DISABLE": "账户禁用",
     "WAITING_FOR_REDIAL": "等待重呼",
     "EXPIRED": "任务超时",
     "COMPLETED": "已完成",
@@ -33,12 +34,15 @@ TASK_STATUS_LABELS = {
     "ARCHIVED": "已归档",
 }
 
-# 官方：未开始 / 可运行 / 用户暂停 / 系统挂起 可以启动；PAUSED、STOPPED 为后台历史别名
+# 官方「启动任务」接口说明：可开始的任务状态为 未开始 / 用户暂停 / 系统挂起 / 账号禁用 / 系统维护；
+# PAUSED、STOPPED 为后台历史别名，保留兼容
 STARTABLE_TASK_STATUSES = {
     "NOT_STARTED",
     "RUNNABLE",
     "USER_PAUSE",
     "SYSTEM_HANG_UP",
+    "ACCOUNT_DISABLE",
+    "MAINTAIN",
     "PAUSED",
     "STOPPED",
 }

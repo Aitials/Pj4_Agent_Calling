@@ -81,6 +81,13 @@ def test_quote() -> None:
     _check("quote 忽略空白可命中", ca._quote_in_transcript("多少钱一年", transcript))
     _check("改写后的 quote 不命中", not ca._quote_in_transcript("价格太贵了", transcript))
     _check("空 quote 不命中", not ca._quote_in_transcript("  ", transcript))
+    _check("机器人台词不能作为客户原话", not ca._quote_in_transcript("按年付费", transcript))
+    _check("客户多句仍可跨行命中", ca._quote_in_transcript("你们这个系统多少钱一年", transcript))
+    unlabeled = "你们这个系统多少钱一年？按年付费。"
+    _check("无说话人标签退回全文匹配", ca._quote_in_transcript("按年付费", unlabeled))
+    only_bot = "AI：您好，请问需要报价吗？客户：不需要。"
+    _check("只引用机器人台词被拒绝", not ca._quote_in_transcript("请问需要报价吗", only_bot))
+    _check("客户发言可命中", ca._quote_in_transcript("不需要", only_bot))
 
 
 def test_judge() -> None:

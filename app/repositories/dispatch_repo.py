@@ -26,42 +26,53 @@ def list_enabled_assignees() -> list[dict]:
         conn.close()
 
 
-def next_assignee() -> dict | None:
-    """按 sort_order 轮转取下一个销售；名单为空返回 None。"""
-    conn = connect()
+def next_assignee(conn=None) -> dict | None:
+    """按 sort_order 轮转取下一个销售；名单为空返回 None。
+
+    传入 conn 时复用调用方事务（与通知入队同一事务，避免游标已提交但入队失败），
+    此时不 begin / commit / close。
+    """
+    if conn is not None:
+        return _next_assignee_locked(conn)
+
+    own_conn = connect()
     try:
-        conn.begin()
-        with conn.cursor() as cur:
-            cur.execute("SELECT `last_open_id` FROM `dispatch_assignee_cursor` WHERE `id` = 1 FOR UPDATE")
-            row = cur.fetchone() or {}
-            last_open_id = row.get("last_open_id")
-
-            cur.execute(
-                "SELECT `open_id`, `name` FROM `sales_assignee` "
-                "WHERE `enabled` = 1 ORDER BY `sort_order`, `open_id`"
-            )
-            assignees = list(cur.fetchall())
-            if not assignees:
-                conn.commit()
-                return None
-
-            open_ids = [item["open_id"] for item in assignees]
-            index = open_ids.index(last_open_id) if last_open_id in open_ids else -1
-            chosen = assignees[(index + 1) % len(assignees)]
-
-            cur.execute(
-                "INSERT INTO `dispatch_assignee_cursor` (`id`, `last_open_id`) "
-                "VALUES (1, %s) "
-                "ON DUPLICATE KEY UPDATE `last_open_id` = VALUES(`last_open_id`)",
-                (chosen["open_id"],),
-            )
-        conn.commit()
+        own_conn.begin()
+        chosen = _next_assignee_locked(own_conn)
+        own_conn.commit()
         return chosen
     except pymysql.MySQLError:
-        conn.rollback()
+        own_conn.rollback()
         raise
     finally:
-        conn.close()
+        own_conn.close()
+
+
+def _next_assignee_locked(conn) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT `last_open_id` FROM `dispatch_assignee_cursor` WHERE `id` = 1 FOR UPDATE")
+        row = cur.fetchone() or {}
+        last_open_id = row.get("last_open_id")
+
+        cur.execute(
+            "SELECT `open_id`, `name` FROM `sales_assignee` "
+            "WHERE `enabled` = 1 ORDER BY `sort_order`, `open_id`"
+        )
+        assignees = list(cur.fetchall())
+        if not assignees:
+            return None
+
+        open_ids = [item["open_id"] for item in assignees]
+        index = open_ids.index(last_open_id) if last_open_id in open_ids else -1
+        chosen = assignees[(index + 1) % len(assignees)]
+
+        cur.execute(
+            "INSERT INTO `dispatch_assignee_cursor` (`id`, `last_open_id`) "
+            "VALUES (1, %s) "
+            "ON DUPLICATE KEY UPDATE `last_open_id` = VALUES(`last_open_id`)",
+            (chosen["open_id"],),
+        )
+    return chosen
 
 
 def enqueue_notice(notice: dict, conn=None) -> int | None:
@@ -260,7 +271,8 @@ def claim_analysis_pending(limit: int = 20, max_retry: int = 3) -> list[dict]:
                 ids = [row["id"] for row in rows]
                 placeholders = ", ".join(["%s"] * len(ids))
                 cur.execute(
-                    f"UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING' "
+                    f"UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING', "
+                    f"    `updated_at` = NOW() "
                     f"WHERE `id` IN ({placeholders})",
                     tuple(ids),
                 )
@@ -274,13 +286,19 @@ def claim_analysis_pending(limit: int = 20, max_retry: int = 3) -> list[dict]:
 
 
 def reclaim_analysis_sending(minutes: int = 10) -> int:
-    """把长时间停留在 SENDING 的分析通知放回 PENDING。"""
+    """把长时间停留在 SENDING 的分析通知放回 PENDING。
+
+    必须按「抢占时间」回收：claim_analysis_pending 会显式把 updated_at 置为 NOW()，
+    因此这里用 updated_at 就是抢占时刻。若用 created_at / 旧 updated_at，
+    刚被抢占的老记录会被立即放回 PENDING，导致重复发送分析卡片。
+    """
     minutes = max(1, int(minutes or 10))
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE `dispatch_notice` SET `analysis_status` = 'PENDING' "
+                "UPDATE `dispatch_notice` SET `analysis_status` = 'PENDING', "
+                "  `updated_at` = NOW() "
                 f"WHERE `analysis_status` = 'SENDING' "
                 f"  AND `updated_at` < NOW() - INTERVAL {minutes} MINUTE"
             )
@@ -307,26 +325,37 @@ def mark_analysis_pending(record_id: str) -> None:
 
 
 def mark_analysis_sending(notice_id: int) -> None:
-    _update(
-        "UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING' WHERE `id` = %s",
+    # 只允许 PENDING/FAILED → SENDING：已 SENT 或已被撤销的不可被重新抢占
+    affected = _update(
+        "UPDATE `dispatch_notice` SET `analysis_status` = 'SENDING', `updated_at` = NOW() "
+        "WHERE `id` = %s AND `analysis_status` IN ('PENDING', 'FAILED')",
         (int(notice_id),),
     )
+    if affected == 0:
+        log.warning("通知 %s 不在 PENDING/FAILED，mark_analysis_sending 未生效", notice_id)
 
 
 def mark_analysis_sent(notice_id: int, card_message_id: str | None = None) -> None:
+    # 只允许 SENDING → SENT：被超时回收或撤销后不回退覆盖
     if card_message_id:
-        _update(
+        affected = _update(
             "UPDATE `dispatch_notice` "
             "SET `analysis_status` = 'SENT', `card_message_id` = %s, `updated_at` = NOW() "
-            "WHERE `id` = %s",
+            "WHERE `id` = %s AND `analysis_status` = 'SENDING'",
             (card_message_id, int(notice_id)),
         )
-        return
-    _update(
-        "UPDATE `dispatch_notice` "
-        "SET `analysis_status` = 'SENT', `updated_at` = NOW() WHERE `id` = %s",
-        (int(notice_id),),
-    )
+    else:
+        affected = _update(
+            "UPDATE `dispatch_notice` "
+            "SET `analysis_status` = 'SENT', `updated_at` = NOW() "
+            "WHERE `id` = %s AND `analysis_status` = 'SENDING'",
+            (int(notice_id),),
+        )
+    if affected == 0:
+        log.warning(
+            "通知 %s 已不处于 SENDING，mark_analysis_sent 未生效（可能被回收或撤销）",
+            notice_id,
+        )
 
 
 def mark_analysis_failed(
@@ -337,12 +366,18 @@ def mark_analysis_failed(
 ) -> None:
     """分析通知失败：未超限回到 PENDING，超限置 FAILED。"""
     status = "PENDING" if int(retry_count) < max(1, int(max_retry)) else "FAILED"
-    _update(
+    affected = _update(
         "UPDATE `dispatch_notice` "
-        "SET `analysis_status` = %s, `analysis_retry_count` = %s, `error_msg` = %s "
-        "WHERE `id` = %s",
+        "SET `analysis_status` = %s, `analysis_retry_count` = %s, `error_msg` = %s, "
+        "    `updated_at` = NOW() "
+        "WHERE `id` = %s AND `analysis_status` = 'SENDING'",
         (status, int(retry_count), str(error_msg)[:512], int(notice_id)),
     )
+    if affected == 0:
+        log.warning(
+            "通知 %s 已不处于 SENDING，mark_analysis_failed 未生效（可能被回收或撤销）",
+            notice_id,
+        )
 
 
 def mark_attachment_pending(notice_id: int) -> None:
@@ -466,22 +501,30 @@ def get_notice(notice_id: int) -> dict | None:
         conn.close()
 
 
-def get_notice_by_record(record_id: str) -> dict | None:
-    """同一通电话是否已经入过队，避免重复轮转销售。"""
+def get_notice_by_record(record_id: str, conn=None, for_update: bool = False) -> dict | None:
+    """同一通电话是否已经入过队，避免重复轮转销售。
+
+    传入 conn 时复用调用方事务，不提交也不关闭。
+    for_update=True 时用加锁读：在入库事务里先锁住该 record_id 的索引间隙，
+    并发回调只能有一个走到轮转与入队。
+    """
     record_id = (record_id or "").strip()
     if not record_id:
         return None
-    conn = connect()
+    own_conn = conn is None
+    conn = conn or connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM `dispatch_notice` "
-                "WHERE `trigger_record_id` = %s ORDER BY `id` LIMIT 1",
+                "WHERE `trigger_record_id` = %s ORDER BY `id` LIMIT 1"
+                + (" FOR UPDATE" if for_update else ""),
                 (record_id,),
             )
             return cur.fetchone()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def cancel_notice(record_id: str, reason: str = "") -> str | None:

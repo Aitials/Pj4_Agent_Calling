@@ -15,7 +15,6 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +47,13 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
+from app.channels import (
+    get_active_channel as _registry_active_channel,
+    get_current_message as _registry_current_message,
+    register_channel,
+    reset_current_message,
+    set_current_message,
+)
 from app.channels.base import Channel, IncomingMessage, MediaAttachment, MessageHandler
 from app.core.config import (
     ALLOW_GROUP_CHAT,
@@ -84,9 +90,6 @@ _DEFAULT_SUFFIX = {
 }
 
 _active_channel: "FeishuChannel | None" = None
-_current_message: ContextVar[IncomingMessage | None] = ContextVar(
-    "feishu_current_message", default=None
-)
 
 
 def _safe_name(name: str) -> str:
@@ -191,11 +194,12 @@ def _stream_card_json() -> str:
 
 
 def get_active_channel() -> "FeishuChannel | None":
-    return _active_channel
+    # 兼容旧调用：统一走通道注册表
+    return _registry_active_channel() or _active_channel
 
 
 def get_current_message() -> IncomingMessage | None:
-    return _current_message.get()
+    return _registry_current_message()
 
 
 class FeishuChannel(Channel):
@@ -224,6 +228,7 @@ class FeishuChannel(Channel):
         # 任务表单卡片回调处理，由 router 注入
         self._form_handler: Any = None
         _active_channel = self
+        register_channel(self)
 
     # ------------------------------------------------------------------ 启动
 
@@ -280,11 +285,11 @@ class FeishuChannel(Channel):
                 except Exception:
                     log.exception("发送任务表单失败")
                 continue
-            token = _current_message.set(message)
+            token = set_current_message(message)
             try:
                 await on_message(message)
             finally:
-                _current_message.reset(token)
+                reset_current_message(token)
 
     def _run_ws(self, ws: Any) -> None:
         try:

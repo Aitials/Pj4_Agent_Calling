@@ -60,6 +60,14 @@ DINGTALK_ROBOT_CODE = get_env("DINGTALK_ROBOT_CODE").strip()
 # 应用标识，预留（Stream 收发不依赖）
 DINGTALK_AGENT_ID = get_env("DINGTALK_AGENT_ID").strip()
 
+# ===== 一知回调安全 =====
+# 时间窗校验，超过窗口的 timestamp 直接拒绝（秒）；0 表示关闭窗口校验
+AICC_CALLBACK_MAX_SKEW_SECONDS = int(
+    get_env("AICC_CALLBACK_MAX_SKEW_SECONDS", "300").strip() or 300
+)
+# 解密后明文尾部的 receiveid；未配置时跳过接收方标识校验
+AICC_CALLBACK_RECEIVE_ID = get_env("AICC_CALLBACK_RECEIVE_ID").strip()
+
 
 @dataclass(frozen=True)
 class Settings:

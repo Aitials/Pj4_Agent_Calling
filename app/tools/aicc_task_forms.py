@@ -61,13 +61,13 @@ def _claim_open(key: str) -> bool:
 
 def _open(kind: str) -> str:
     # 延迟导入：避免工具层与通道层在模块加载期互相依赖
-    from app.channels.feishu import get_active_channel, get_current_message
+    from app.channels import get_active_channel, get_current_message
     from app.flows import aicc_task_flow
 
     channel = get_active_channel()
     message = get_current_message()
-    if channel is None or message is None:
-        return "当前不在飞书会话中，无法发送表单卡片。"
+    if channel is None or message is None or getattr(channel, "name", "") != "feishu":
+        return "当前渠道暂不支持表单卡片，请在飞书中操作。"
 
     if not _has_intent(message.text, kind):
         action = "创建" if kind == "create" else "启动"
@@ -145,13 +145,13 @@ def _has_status_intent(text: str) -> bool:
 
 
 def _open_status(task_keyword: str) -> str:
-    from app.channels.feishu import get_active_channel, get_current_message
+    from app.channels import get_active_channel, get_current_message
     from app.flows import aicc_task_flow
 
     channel = get_active_channel()
     message = get_current_message()
-    if channel is None or message is None:
-        return "当前不在飞书会话中，无法发送任务状态卡片。"
+    if channel is None or message is None or getattr(channel, "name", "") != "feishu":
+        return "当前渠道暂不支持任务状态卡片，请在飞书中操作。"
 
     if not _has_status_intent(message.text):
         return (

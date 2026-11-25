@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -34,9 +35,12 @@ from app.repositories import call_record_repo  # noqa: E402
 OK = "\033[32m✓\033[0m"
 NG = "\033[31m✗\033[0m"
 failures: list[str] = []
+total = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
+    global total
+    total += 1
     print(f"  {OK if cond else NG} {name}" + (f"  {detail}" if detail else ""))
     if not cond:
         failures.append(name)
@@ -102,7 +106,8 @@ def main() -> int:
     payload = build_payload(record_id)
     plaintext = json.dumps(payload, ensure_ascii=False)
     encrypt = crypto.encrypt(plaintext)
-    ts, nonce = "1731900000", "selftest"
+    # 时间戳必须落在允许窗口内（AICC_CALLBACK_MAX_SKEW_SECONDS，默认 300 秒）
+    ts, nonce = str(int(time.time())), "selftest-1"
 
     print(f"\n== 1. URL 验证（GET {CALLBACK_PATH}）==")
     sig = crypto.signature(ts, nonce, encrypt)
@@ -117,7 +122,7 @@ def main() -> int:
     print("\n== 2. 业务回调（POST 密文 XML）==")
     captured: dict = {}
 
-    def fake_upsert(row: dict) -> None:
+    def fake_upsert(row: dict, conn=None) -> None:
         captured.update(row)
 
     original = call_record_repo.upsert_call_record
@@ -150,10 +155,13 @@ def main() -> int:
         check("首句为机器人开场", row.get("first_message") == "喂，您好", str(row.get("first_message")))
         check("原始报文已保留", isinstance(row.get("raw_json"), dict))
 
-    print("\n== 3. 幂等（同一 record_id 再推一次）==")
+    print("\n== 3. 幂等与防重放 ==")
     calls: list[str] = []
-    callback_service.call_record_repo.upsert_call_record = lambda r: calls.append(r.get("record_id"))
+    callback_service.call_record_repo.upsert_call_record = (
+        lambda r, conn=None: calls.append(r.get("record_id"))
+    )
     try:
+        # 同一 nonce 重复投递：应直接确认，不再入库
         r2 = client.post(
             CALLBACK_PATH,
             params={"msg_signature": sig, "timestamp": ts, "nonce": nonce},
@@ -161,24 +169,49 @@ def main() -> int:
         )
     finally:
         callback_service.call_record_repo.upsert_call_record = original
-    check("重复回调仍返回 success", r2.status_code == 200 and r2.text.strip() == "success")
-    check("重复回调走 upsert（非 insert）", calls == [record_id], str(calls))
+    check("重复 nonce 仍返回 success", r2.status_code == 200 and r2.text.strip() == "success")
+    check("重复 nonce 不重复入库", calls == [], str(calls))
+
+    # 新 nonce、同一 record_id：验签通过，走 upsert 幂等
+    nonce_retry = "selftest-retry"
+    sig_retry = crypto.signature(ts, nonce_retry, encrypt)
+    callback_service.call_record_repo.upsert_call_record = (
+        lambda r, conn=None: calls.append(r.get("record_id"))
+    )
+    try:
+        r6 = client.post(
+            CALLBACK_PATH,
+            params={"msg_signature": sig_retry, "timestamp": ts, "nonce": nonce_retry},
+            content=f"<xml><Encrypt><![CDATA[{encrypt}]]></Encrypt></xml>".encode(),
+        )
+    finally:
+        callback_service.call_record_repo.upsert_call_record = original
+    check("新 nonce 重复推送仍返回 success", r6.status_code == 200 and r6.text.strip() == "success")
+    check("同一 record_id 走 upsert（非 insert）", calls == [record_id], str(calls))
 
     print("\n== 4. 异常分支 ==")
     r3 = client.post(
         CALLBACK_PATH,
-        params={"msg_signature": "0" * 40, "timestamp": ts, "nonce": nonce},
+        params={"msg_signature": "0" * 40, "timestamp": ts, "nonce": "selftest-3"},
         content=body.encode(),
     )
     check("签名错误返回 403", r3.status_code == 403, f"status={r3.status_code}")
+    old_ts = str(int(time.time()) - 3600)
+    old_sig = crypto.signature(old_ts, "selftest-old", encrypt)
+    r7 = client.post(
+        CALLBACK_PATH,
+        params={"msg_signature": old_sig, "timestamp": old_ts, "nonce": "selftest-old"},
+        content=body.encode(),
+    )
+    check("时间戳超出窗口返回 403", r7.status_code == 403, f"status={r7.status_code}")
     r4 = client.get(
         CALLBACK_PATH,
-        params={"msg_signature": sig, "timestamp": ts, "nonce": nonce},
+        params={"msg_signature": sig, "timestamp": ts, "nonce": "selftest-4"},
     )
     check("缺少 echostr 返回 400", r4.status_code == 400, f"status={r4.status_code}")
     r5 = client.post(
         CALLBACK_PATH,
-        params={"msg_signature": sig, "timestamp": ts, "nonce": nonce},
+        params={"msg_signature": sig, "timestamp": ts, "nonce": "selftest-5"},
         content=b"<xml></xml>",
     )
     check("缺少 Encrypt 返回 400", r5.status_code == 400, f"status={r5.status_code}")
@@ -199,7 +232,7 @@ def main() -> int:
     if failures:
         print(f"{NG} 失败 {len(failures)} 项：" + "、".join(failures))
         return 1
-    print(f"{OK} 全部通过（{8 + (3 if not args.db else 1)} 项断言）")
+    print(f"{OK} 全部通过（{total} 项断言）")
     return 0
 
 
