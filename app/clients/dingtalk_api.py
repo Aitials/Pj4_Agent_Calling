@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 
 import httpx
 
@@ -217,6 +218,79 @@ def mask_secret(value: str, keep: int = 4) -> str:
     if len(text) <= keep * 2:
         return "*" * len(text)
     return f"{text[:keep]}…{text[-keep:]}"
+
+
+# ---------------------------------------------------------------------------
+# AI 互动卡片：流式输出（打字机）
+# ---------------------------------------------------------------------------
+
+
+def _card_request(method: str, path: str, payload: dict) -> bool:
+    """卡片接口调用；失败记日志并返回 False，由调用方决定是否降级。"""
+    for attempt in range(2):
+        token = access_token(force=attempt > 0)
+        if not token:
+            return False
+        try:
+            with _http_client() as client:
+                response = client.request(
+                    method,
+                    path,
+                    headers={"x-acs-dingtalk-access-token": token},
+                    json=payload,
+                )
+                data = _json(response)
+        except Exception:  # noqa: BLE001
+            log.exception("钉钉卡片接口请求失败 path=%s", path)
+            return False
+
+        if response.status_code == 401 and attempt == 0:
+            log.info("钉钉 accessToken 失效，刷新后重试 path=%s", path)
+            continue
+
+        code = str(data.get("code") or "")
+        if response.status_code >= 400 or code not in ("", "0"):
+            log.warning(
+                "钉钉卡片接口失败 path=%s %s",
+                path,
+                _format_error(response.status_code, data),
+            )
+            return False
+        return True
+    return False
+
+
+def stream_card(card_instance_id: str, text: str, *, append: bool = False) -> bool:
+    """流式更新 AI 卡片正文；append=False 表示全量替换（默认）。"""
+    if not card_instance_id:
+        return False
+    return _card_request(
+        "PUT",
+        "/v1.0/card/streaming",
+        {
+            "outTrackId": card_instance_id,
+            "guid": str(uuid.uuid1()),
+            "key": "msgContent",
+            "content": text,
+            "isFull": not append,
+            "isFinalize": False,
+            "isError": False,
+        },
+    )
+
+
+def update_card(card_instance_id: str, card_data: dict) -> bool:
+    """整体更新卡片数据（收尾、状态切换）。"""
+    if not card_instance_id:
+        return False
+    return _card_request(
+        "PUT",
+        "/v1.0/card/instances",
+        {
+            "outTrackId": card_instance_id,
+            "cardData": {"cardParamMap": card_data},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

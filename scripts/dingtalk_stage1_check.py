@@ -13,6 +13,7 @@
     python scripts/dingtalk_stage1_check.py group --conversation-id <openConversationId> [--text 文本]
     python scripts/dingtalk_stage1_check.py stream [--seconds 120]
     python scripts/dingtalk_stage1_check.py replay [--file 回调.json]
+    python scripts/dingtalk_stage1_check.py card --user-id <userId> [--llm] [--interval 0.6]
 
 注意：
 - 同一个应用只允许一条 Stream 长连接，跑 --stream 前先停掉 run_dingtalk.py；
@@ -45,7 +46,9 @@ from dingtalk_stream import (  # noqa: E402
     EventHandler,
     EventMessage,
 )
+from dingtalk_stream.card_instance import AIMarkdownCardInstance  # noqa: E402
 
+from app.agents.base_agent import BaseAgent  # noqa: E402
 from app.clients import dingtalk_api  # noqa: E402
 from app.core.config import (  # noqa: E402
     DINGTALK_AGENT_ID,
@@ -53,6 +56,7 @@ from app.core.config import (  # noqa: E402
     DINGTALK_CLIENT_SECRET,
     DINGTALK_CORP_ID,
     DINGTALK_ROBOT_CODE,
+    Settings,
 )
 
 log = logging.getLogger("dingtalk_check")
@@ -167,6 +171,88 @@ async def _run_replay(data: dict) -> int:
     return 0 if first == 1 and second == 1 else 1
 
 
+CARD_PROMPT = "请完整背诵《出师表》全文，逐段输出，不要省略，不要解释，不要加标题。"
+CARD_PIECES = [
+    "【AI 卡片流式冒烟】",
+    "这是静态分段推送，",
+    "用于验证卡片能力与刷新频率。\n\n",
+    "1. 建卡成功\n",
+    "2. 流式更新中\n",
+    "3. 准备收尾",
+]
+
+
+def _fake_message(user_id: str) -> ChatbotMessage:
+    """构造一个单聊消息壳，仅用于卡片投放（不经过 Stream）。"""
+    msg = ChatbotMessage()
+    msg.sender_staff_id = user_id
+    msg.sender_nick = "卡片冒烟"
+    msg.sender_id = "selftest-sender"
+    msg.sender_corp_id = "selftest-corp"
+    msg.conversation_id = "cid-selftest"
+    msg.conversation_type = "1"
+    msg.message_id = f"selftest-card-{int(time.time())}"
+    msg.chatbot_user_id = "selftest-bot"
+    return msg
+
+
+async def _run_card(user_id: str, use_llm: bool, interval: float) -> int:
+    """发一张 AI 卡片验证流式输出；--llm 时用真实模型生成《出师表》。"""
+    client = DingTalkStreamClient(
+        Credential(DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET),
+        logger=logging.getLogger("dingtalk_stream"),
+    )
+    card = AIMarkdownCardInstance(client, _fake_message(user_id))
+    card.set_title_and_logo("AI 助手 · 流式冒烟", "")
+
+    started = time.perf_counter()
+    await asyncio.to_thread(card.ai_start)
+    if not card.card_instance_id:
+        print("建卡失败：检查卡片能力、模板与出口 IP 白名单")
+        return 1
+    print(f"建卡+投放成功：{time.perf_counter() - started:.2f}s")
+
+    answer = ""
+    updates = 0
+    latencies: list[float] = []
+    pushed_chars = 0
+    last_push = time.perf_counter()
+
+    if use_llm:
+        settings = Settings.load()
+        agent = BaseAgent(settings)
+        print(f"LLM: {settings.llm_model}")
+        async for delta in agent.astream(CARD_PROMPT):
+            answer += delta
+            now = time.perf_counter()
+            if now - last_push >= interval and len(answer) - pushed_chars >= 20:
+                t1 = time.perf_counter()
+                await asyncio.to_thread(card.ai_streaming, answer)
+                latencies.append(time.perf_counter() - t1)
+                pushed_chars = len(answer)
+                updates += 1
+                last_push = time.perf_counter()
+    else:
+        for piece in CARD_PIECES:
+            answer += piece
+            t1 = time.perf_counter()
+            await asyncio.to_thread(card.ai_streaming, answer)
+            latencies.append(time.perf_counter() - t1)
+            updates += 1
+            await asyncio.sleep(interval)
+
+    await asyncio.to_thread(card.ai_finish, answer)
+    total = time.perf_counter() - started
+    avg = sum(latencies) / len(latencies) if latencies else 0.0
+    print("\n===== 卡片流式结果 =====")
+    print(f"内容长度: {len(answer)} 字")
+    print(f"更新次数: {updates}")
+    print(f"单次推流耗时: avg={avg:.2f}s max={max(latencies, default=0):.2f}s")
+    print(f"整体耗时: {total:.2f}s")
+    print("请到钉钉单聊查看卡片是否逐段刷新、最终为完成态")
+    return 0
+
+
 class _VerifyEventHandler(EventHandler):
     """事件订阅 handler：让客户端上报 EVENT: *，供后台"验证连接通道"通过。"""
 
@@ -265,6 +351,11 @@ def main() -> int:
     replay = sub.add_parser("replay", help="重放同一回调帧验证 msgId 去重")
     replay.add_argument("--file", help="回调 JSON 文件；缺省使用内置样例")
 
+    card = sub.add_parser("card", help="发送 AI 卡片验证流式输出")
+    card.add_argument("--user-id", required=True, help="接收人明文 userId")
+    card.add_argument("--llm", action="store_true", help="用真实 LLM 生成《出师表》")
+    card.add_argument("--interval", type=float, default=0.6, help="两次推流间隔（秒）")
+
     args = parser.parse_args()
 
     if args.command in (None, "check"):
@@ -275,6 +366,14 @@ def main() -> int:
         return cmd_push(args.user_id, args.text)
     if args.command == "group":
         return cmd_group(args.conversation_id, args.text)
+    if args.command == "card":
+        if not dingtalk_api.is_configured():
+            print("缺少 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET，请先配置 .env")
+            return 1
+        return asyncio.run(
+            _run_card(args.user_id, args.llm, max(0.1, args.interval)),
+            loop_factory=asyncio.SelectorEventLoop,
+        )
     if args.command == "replay":
         data = SAMPLE_CALLBACK
         if args.file:

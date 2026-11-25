@@ -3,7 +3,8 @@
 Stream 模式免公网回调、免 AES 加解密：SDK 主动连钉钉网关，
 订阅机器人消息 topic `/v1.0/im/bot/messages/get`。
 回调里的 senderStaffId 就是明文 userId，会话记忆直接按它隔离。
-钉钉机器人没有逐字推送机制，流式回答降级为「处理中提示 + 完成后整段结果」。
+回答通过 AI 互动卡片流式输出（ai_start → ai_streaming → ai_finish），
+卡片不可用或中途失败时回退为「处理中提示 + 完成后整段结果」。
 
 注意：事件订阅（EVENT）与机器人消息（CALLBACK）是两条独立通道。
 后台「事件订阅 → Stream 模式推送 → 验证连接通道」校验的是 EVENT 通道，
@@ -29,6 +30,7 @@ from dingtalk_stream import (
     EventHandler,
     EventMessage,
 )
+from dingtalk_stream.card_instance import AIMarkdownCardInstance
 
 from app.channels.base import Channel, IncomingMessage, MessageHandler
 from app.clients import dingtalk_api
@@ -36,11 +38,21 @@ from app.core.config import DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET
 
 log = logging.getLogger("dingtalk")
 
-# 回答超过该时长仍未完成时，先回一条「处理中」
+# 回答超过该时长仍未完成时，先回一条「处理中」（仅回退路径使用）
 PROCESSING_HINT_DELAY = 4.0
 MAX_SEEN_IDS = 500
 _SEEN_TTL_SECONDS = 600.0
 _WEBHOOK_TIMEOUT_SECONDS = 5.0
+
+# ===== AI 卡片流式参数（2026-11-25 实测校准）=====
+CARD_MIN_INTERVAL = 0.6       # 两次推流的最小间隔（秒）
+CARD_MIN_CHARS = 20           # 单次推流的最少新增字数
+CARD_MAX_UPDATES = 80         # 单张卡片最多推流次数
+CARD_MAX_SECONDS = 120.0      # 单张卡片最长推流时长
+CARD_HINT_INTERVAL = 8.0      # 无内容时的进度提示间隔
+CARD_SLOW_THRESHOLD = 1.0     # 单次推流超过该耗时视为网络慢
+CARD_RECOVER_STREAK = 2       # 连续正常多少次后恢复推流间隔
+CARD_FAIL_LIMIT = 3           # 连续失败多少次后放弃卡片、改用文本兜底
 
 
 class _BotHandler(ChatbotHandler):
@@ -71,6 +83,204 @@ class _EventHandler(EventHandler):
         topic = getattr(getattr(event, "headers", None), "topic", "")
         log.info("收到钉钉事件订阅推送 topic=%s", topic)
         return AckMessage.STATUS_OK, "OK"
+
+
+class _ObservableAiCard(AIMarkdownCardInstance):
+    """覆盖 SDK 的两个网络方法，让推流/收尾结果可判断（SDK 原生只打日志）。"""
+
+    def __init__(self, client, incoming) -> None:
+        super().__init__(client, incoming)
+        self.last_stream_ok = True
+        self.last_update_ok = True
+
+    def streaming(
+        self, card_instance_id, content_key, content_value, append, finished, failed
+    ):
+        ok = dingtalk_api.stream_card(
+            card_instance_id, content_value, append=append
+        )
+        self.last_stream_ok = ok
+        return ok
+
+    def put_card_data(self, card_instance_id: str, card_data: dict, **kwargs):
+        ok = dingtalk_api.update_card(card_instance_id, card_data)
+        self.last_update_ok = ok
+        return ok
+
+
+class _AnswerCard:
+    """一次回答的 AI 卡片生命周期：建卡 → 节流推流 → 收尾。
+
+    采集与推送解耦：feed() 只更新最新全文并唤醒推送协程，
+    推送协程串行调用 OpenAPI，永远发送当前全量文本，避免乱序。
+    """
+
+    def __init__(
+        self,
+        client,
+        incoming,
+        *,
+        title: str = "AI 助手",
+        card_factory=None,
+        min_interval: float = CARD_MIN_INTERVAL,
+        min_chars: int = CARD_MIN_CHARS,
+        max_updates: int = CARD_MAX_UPDATES,
+        max_seconds: float = CARD_MAX_SECONDS,
+        hint_interval: float = CARD_HINT_INTERVAL,
+    ) -> None:
+        factory = card_factory or _ObservableAiCard
+        self._card = factory(client, incoming)
+        self._card.set_title_and_logo(title, "")
+
+        self._latest = ""
+        self._sent = ""
+        self._event = asyncio.Event()
+        self._closed = False
+        self._broken = False
+        self._updates = 0
+        self._fail_streak = 0
+        self._ok_streak = 0
+        self._base_interval = max(0.05, float(min_interval))
+        self._interval = self._base_interval
+        self._min_chars = max(1, int(min_chars))
+        self._max_updates = max(1, int(max_updates))
+        self._max_seconds = max(1.0, float(max_seconds))
+        self._hint_interval = max(0.5, float(hint_interval))
+        self._last_push = 0.0
+        self._last_cost = 0.0
+        self._started = 0.0
+        self._push_task: asyncio.Task | None = None
+        self._hint_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------ 生命周期
+
+    async def start(self) -> bool:
+        try:
+            await asyncio.to_thread(self._card.ai_start)
+        except Exception:  # noqa: BLE001
+            log.exception("钉钉 AI 卡片创建异常")
+            return False
+        if not getattr(self._card, "card_instance_id", ""):
+            return False
+
+        self._started = time.monotonic()
+        self._push_task = asyncio.create_task(self._push_loop())
+        self._hint_task = asyncio.create_task(self._hint_loop())
+        return True
+
+    def feed(self, text: str) -> None:
+        if self._closed:
+            return
+        self._latest = text
+        self._event.set()
+
+    async def finish(self, text: str) -> bool:
+        await self._stop()
+        if self._broken:
+            return False
+        self._card.last_update_ok = True
+        try:
+            await asyncio.to_thread(self._card.ai_finish, text)
+        except Exception:  # noqa: BLE001
+            log.exception("钉钉卡片收尾异常")
+            return False
+        return getattr(self._card, "last_update_ok", True)
+
+    async def fail(self) -> None:
+        await self._stop()
+        try:
+            await asyncio.to_thread(self._card.ai_fail)
+        except Exception:  # noqa: BLE001
+            log.exception("钉钉卡片标记失败态异常")
+
+    # ------------------------------------------------------------------ 推送
+
+    async def _push_loop(self) -> None:
+        while not self._closed:
+            await self._event.wait()
+            self._event.clear()
+            while not self._closed:
+                text = self._latest
+                if text == self._sent:
+                    break
+                now = time.monotonic()
+                if (
+                    now - self._started >= self._max_seconds
+                    or self._updates >= self._max_updates
+                ):
+                    # 达到上限后只保留本地全文，等收尾一次性写完
+                    self._sent = text
+                    break
+                if now - self._last_push < self._interval:
+                    break
+                if len(text) - len(self._sent) < self._min_chars:
+                    break
+
+                if not await self._push(text):
+                    self._fail_streak += 1
+                    self._ok_streak = 0
+                    if self._fail_streak >= CARD_FAIL_LIMIT:
+                        self._broken = True
+                        log.warning("钉钉卡片连续推流失败，改用文本兜底")
+                        return
+                    # 失败后稍作退避，避免无内容变化时紧循环重试
+                    await asyncio.sleep(min(self._interval, 1.0))
+                    continue
+
+                self._fail_streak = 0
+                self._sent = text
+                self._updates += 1
+                self._adapt_interval()
+                if self._latest == text:
+                    break
+
+    async def _hint_loop(self) -> None:
+        """首字前的进度提示，避免十几秒只有一张空卡片。"""
+        while not self._closed and not self._sent:
+            await asyncio.sleep(self._hint_interval)
+            if self._closed or self._sent:
+                return
+            elapsed = int(time.monotonic() - self._started)
+            await self._push(f"正在思考…（已用时 {elapsed} 秒）")
+
+    async def _push(self, text: str) -> bool:
+        async with self._lock:
+            started = time.monotonic()
+            try:
+                await asyncio.to_thread(self._card.ai_streaming, text)
+            except Exception:  # noqa: BLE001
+                log.exception("钉钉卡片推流异常")
+                return False
+            self._last_cost = time.monotonic() - started
+            self._last_push = time.monotonic()
+        return getattr(self._card, "last_stream_ok", True)
+
+    def _adapt_interval(self) -> None:
+        """网络抖动时放大间隔，连续正常后逐步恢复。"""
+        if self._last_cost >= CARD_SLOW_THRESHOLD:
+            self._ok_streak = 0
+            self._interval = min(self._interval * 2, 4.0)
+            return
+        self._ok_streak += 1
+        if self._ok_streak >= CARD_RECOVER_STREAK:
+            self._interval = max(self._base_interval, self._interval / 2)
+            self._ok_streak = 0
+
+    async def _stop(self) -> None:
+        self._closed = True
+        self._event.set()
+        if self._hint_task is not None:
+            self._hint_task.cancel()
+            try:
+                await self._hint_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._push_task is not None:
+            try:
+                await asyncio.wait_for(self._push_task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._push_task.cancel()
 
 
 class DingtalkChannel(Channel):
@@ -243,7 +453,51 @@ class DingtalkChannel(Channel):
     async def reply_stream(
         self, message: IncomingMessage, chunks: AsyncIterator[str]
     ) -> str:
-        """钉钉不支持逐字上屏：先挂「处理中」，完成后整段发结果。"""
+        """优先用 AI 卡片流式输出；卡片不可用时回退为整段文本。"""
+        raw = message.reply_handle
+        if not isinstance(raw, ChatbotMessage) or self._client is None:
+            return await self._reply_plain_stream(message, chunks)
+
+        card = _AnswerCard(self._client, raw)
+        if not await card.start():
+            log.warning(
+                "钉钉 AI 卡片创建失败，回退文本回复 conversation=%s",
+                message.conversation_id,
+            )
+            return await self._reply_plain_stream(message, chunks)
+
+        answer = ""
+        try:
+            async for delta in chunks:
+                answer += delta
+                card.feed(answer)
+        except Exception:  # noqa: BLE001
+            log.exception("钉钉卡片流式生成中断")
+            partial = (
+                answer + "\n\n（生成中断，请重试）"
+                if answer.strip()
+                else "生成中断，请重试"
+            )
+            if not await card.finish(partial):
+                await self._safe_reply(raw, partial, markdown=True)
+            return answer
+
+        if not answer.strip():
+            await card.finish("（没有生成内容）")
+            return ""
+
+        if not await card.finish(answer):
+            log.warning(
+                "钉钉卡片收尾失败，补发文本全文 conversation=%s",
+                message.conversation_id,
+            )
+            await self._safe_reply(raw, answer, markdown=True)
+        return answer
+
+    async def _reply_plain_stream(
+        self, message: IncomingMessage, chunks: AsyncIterator[str]
+    ) -> str:
+        """回退路径：4 秒处理中提示 + 聚合后整段发送。"""
         raw = message.reply_handle
         state = {"done": False}
         hint_task: asyncio.Task | None = None
