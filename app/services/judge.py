@@ -10,7 +10,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from app.repositories import intent_rule_repo
+
+log = logging.getLogger("judge")
 
 LOCAL_LEVELS = {"HIGH", "MEDIUM", "LOW", "INVALID"}
 PROMOTE_LEVELS = {"HIGH", "MEDIUM"}
@@ -38,6 +42,7 @@ def final_decision(record: dict, analysis: dict, *, has_notice: bool) -> tuple[s
     裁决：REVOKE 撤销派单 / PROMOTE 补派单 / KEEP 保留原派单 / NONE 无需动作。
     """
     ai_level = str(analysis.get("intent_level") or "").strip().upper()
+    blocked = bool(analysis.get("blocked"))
     rule = intent_rule_repo.get_rule(
         record.get("intent_level_tag_id"), record.get("intent_level_code")
     )
@@ -46,8 +51,17 @@ def final_decision(record: dict, analysis: dict, *, has_notice: bool) -> tuple[s
         supplier_level = None
     consistent = None if supplier_level is None else int(supplier_level == ai_level)
 
-    if int(analysis.get("blocked") or 0) == 1 or ai_level in {"LOW", "INVALID"}:
+    # 阻断优先判断：blocked 为真或低意向直接撤销，避免异常等级造成漏撤
+    if blocked or ai_level in {"LOW", "INVALID"}:
         return (REVOKE if has_notice else NONE), consistent
+    if ai_level not in LOCAL_LEVELS:
+        # 未知等级不猜：保留既有派单、不新增派单，并留告警便于排查上游
+        log.warning(
+            "AI 意向等级非法，按不动作处理 record=%s level=%r",
+            record.get("record_id"),
+            analysis.get("intent_level"),
+        )
+        return (KEEP if has_notice else NONE), None
     if ai_level in PROMOTE_LEVELS:
         if has_notice:
             return KEEP, consistent

@@ -50,6 +50,15 @@ def analyze_task(task: dict) -> bool:
     if not analysis.get("intent_level"):
         return _fail(lead_id, record_id, retry_count, "分析结果缺少意向等级")
 
+    ai_level = str(analysis.get("intent_level") or "").strip().upper()
+    if ai_level not in judge.LOCAL_LEVELS:
+        return _fail(
+            lead_id,
+            record_id,
+            retry_count,
+            f"分析结果意向等级非法：{analysis.get('intent_level')!r}",
+        )
+
     # 先裁决派单：失败则按重试策略重跑，避免撤销动作静默丢失
     try:
         _decide(record, analysis)

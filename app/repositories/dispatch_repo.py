@@ -129,7 +129,8 @@ def claim_pending(limit: int = 20) -> list[dict]:
                 ids = [row["id"] for row in rows]
                 placeholders = ", ".join(["%s"] * len(ids))
                 cur.execute(
-                    f"UPDATE `dispatch_notice` SET `status` = 'SENDING' "
+                    f"UPDATE `dispatch_notice` SET `status` = 'SENDING', "
+                    f"    `sending_at` = NOW() "
                     f"WHERE `id` IN ({placeholders})",
                     tuple(ids),
                 )
@@ -143,14 +144,21 @@ def claim_pending(limit: int = 20) -> list[dict]:
 
 
 def reclaim_sending(minutes: int = 10) -> int:
-    """把长时间停留在 SENDING 的记录放回 PENDING（进程异常退出后的恢复）。"""
+    """把长时间停留在 SENDING 的记录放回 PENDING（进程异常退出后的恢复）。
+
+    必须按「抢占时间」回收：created_at 是入队时间，用它会把刚被抢占的老记录
+    立即放回 PENDING，导致其他 Worker 重复发送。存量行 sending_at 为空时，
+    退回 updated_at / created_at 兼容。
+    """
     minutes = max(1, int(minutes or 10))
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE `dispatch_notice` SET `status` = 'PENDING' "
-                f"WHERE `status` = 'SENDING' AND `created_at` < NOW() - INTERVAL {minutes} MINUTE"
+                "UPDATE `dispatch_notice` SET `status` = 'PENDING', `sending_at` = NULL "
+                f"WHERE `status` = 'SENDING' "
+                f"  AND COALESCE(`sending_at`, `updated_at`, `created_at`) "
+                f"      < NOW() - INTERVAL {minutes} MINUTE"
             )
             affected = cur.rowcount
         conn.commit()
@@ -168,13 +176,20 @@ def set_task_guid(notice_id: int, task_guid: str) -> None:
 
 def mark_sent(notice_id: int, task_guid: str | None, message_id: str | None) -> None:
     # 只允许 SENDING → SENT：若发送期间被 AI 判定撤销（CANCELLED），不覆盖撤销状态
-    _update(
+    affected = _update(
         "UPDATE `dispatch_notice` "
         "SET `status` = 'SENT', `sent_at` = NOW(), `feishu_task_guid` = %s, "
-        "    `card_message_id` = %s, `error_msg` = NULL, `next_retry_at` = NULL "
+        "    `card_message_id` = %s, `error_msg` = NULL, `next_retry_at` = NULL, "
+        "    `sending_at` = NULL "
         "WHERE `id` = %s AND `status` = 'SENDING'",
         (task_guid, message_id, int(notice_id)),
     )
+    if affected == 0:
+        # 典型原因：被超时回收或被 AI 撤销；消息可能已经发出，必须显式告警
+        log.warning(
+            "通知 %s 已不处于 SENDING，mark_sent 未生效（可能被回收或撤销）",
+            notice_id,
+        )
 
 
 def mark_failed(
@@ -189,13 +204,19 @@ def mark_failed(
     之前固定写 FAILED，而 claim_pending 只扫 PENDING，导致自动重试永远不生效。
     """
     status = "PENDING" if next_retry_at else "FAILED"
-    _update(
+    affected = _update(
         "UPDATE `dispatch_notice` "
         "SET `status` = %s, `error_msg` = %s, `retry_count` = %s, "
-        "    `next_retry_at` = %s, `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`) "
+        "    `next_retry_at` = %s, `sending_at` = NULL, "
+        "    `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`) "
         "WHERE `id` = %s AND `status` = 'SENDING'",
         (status, error_msg[:512], int(retry_count), next_retry_at, task_guid, int(notice_id)),
     )
+    if affected == 0:
+        log.warning(
+            "通知 %s 已不处于 SENDING，mark_failed 未生效（可能被回收或撤销）",
+            notice_id,
+        )
 
 
 def reset_failed() -> int:
@@ -205,7 +226,7 @@ def reset_failed() -> int:
             cur.execute(
                 "UPDATE `dispatch_notice` "
                 "SET `status` = 'PENDING', `retry_count` = 0, "
-                "    `next_retry_at` = NULL, `error_msg` = NULL "
+                "    `next_retry_at` = NULL, `error_msg` = NULL, `sending_at` = NULL "
                 "WHERE `status` = 'FAILED'"
             )
             affected = cur.rowcount
@@ -531,12 +552,15 @@ def enqueue_ai_notice(record: dict) -> int | None:
     return enqueue_notice(notice)
 
 
-def _update(sql: str, params: tuple) -> None:
+def _update(sql: str, params: tuple) -> int:
+    """执行单条 UPDATE，返回受影响行数（0 表示状态前置条件不满足）。"""
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
+            affected = cur.rowcount
         conn.commit()
+        return int(affected or 0)
     except pymysql.MySQLError:
         conn.rollback()
         raise
