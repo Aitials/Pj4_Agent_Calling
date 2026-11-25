@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, datetime, timedelta
 
 from app.clients import tanyibot
@@ -33,6 +35,44 @@ ORDER_TYPES = {
     "LAST_EDIT_TIME": "按最近更新排序",
     "DRAG_SORT": "按拖拽排序",
 }
+
+# Redis 降级时的进程内兜底：同一任务并发只打一次一知，TTL 内复用结果
+_LOCAL_TTL = float(cache.TASK_STATUS_TTL)
+_local_cache: dict[int, tuple[float, dict]] = {}
+_local_locks: dict[int, threading.Lock] = {}
+_local_guard = threading.Lock()
+
+
+def _local_get(job_id: int, now: float) -> dict | None:
+    with _local_guard:
+        hit = _local_cache.get(job_id)
+        if hit is None:
+            return None
+        expires_at, data = hit
+        if expires_at <= now:
+            _local_cache.pop(job_id, None)
+            return None
+        return dict(data)
+
+
+def _local_set(job_id: int, data: dict) -> None:
+    with _local_guard:
+        _local_cache[job_id] = (time.monotonic() + _LOCAL_TTL, dict(data))
+
+
+def _job_lock(job_id: int) -> threading.Lock:
+    with _local_guard:
+        lock = _local_locks.get(job_id)
+        if lock is None:
+            if len(_local_locks) > 500:
+                for key in [
+                    item for item, value in _local_locks.items() if not value.locked()
+                ]:
+                    _local_locks.pop(key, None)
+            lock = threading.Lock()
+            _local_locks[job_id] = lock
+        return lock
+
 
 DAY_LABELS = {
     "MONDAY": "周一",
@@ -181,24 +221,40 @@ def _snapshot(job_id: int, force: bool = False) -> dict:
     if force:
         cache.delete(key)
 
-    def loader() -> dict:
-        detail = tanyibot.get(
-            "/apiEngine/robotCallJob/getById",
-            params={"robotCallJobId": job_id, "systemType": SYSTEM_TYPE},
-        ) or {}
-        stats = tanyibot.get(
-            "/apiEngine/callStats/callJobFullStatsInfo",
-            params={"robotCallJobId": job_id, "systemType": SYSTEM_TYPE},
-        ) or {}
-        return {
-            "detail": detail,
-            "status": fetch_status(job_id),
-            "stats": stats,
-            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+    if not force:
+        hit = _local_get(job_id, time.monotonic())
+        if hit is not None:
+            return hit
 
-    data, _hit = cache.get_or_load(key, loader, cache.TASK_STATUS_TTL)
-    return data or {}
+    # 同一任务串行：后到的线程等先到的请求完成后直接复用结果，
+    # Redis 不可用时也不会把同一个任务并发打三次接口
+    with _job_lock(job_id):
+        if not force:
+            hit = _local_get(job_id, time.monotonic())
+            if hit is not None:
+                return hit
+
+        def loader() -> dict:
+            detail = tanyibot.get(
+                "/apiEngine/robotCallJob/getById",
+                params={"robotCallJobId": job_id, "systemType": SYSTEM_TYPE},
+            ) or {}
+            stats = tanyibot.get(
+                "/apiEngine/callStats/callJobFullStatsInfo",
+                params={"robotCallJobId": job_id, "systemType": SYSTEM_TYPE},
+            ) or {}
+            return {
+                "detail": detail,
+                "status": fetch_status(job_id),
+                "stats": stats,
+                "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        data, _hit = cache.get_or_load(key, loader, cache.TASK_STATUS_TTL)
+        data = data or {}
+        if data:
+            _local_set(job_id, data)
+        return data
 
 
 def _parse_dt(raw: str) -> datetime | None:

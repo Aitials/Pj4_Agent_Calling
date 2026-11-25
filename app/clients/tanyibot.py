@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 from typing import Any
 
 import httpx
@@ -31,6 +32,12 @@ UA = (
 )
 
 _cookie: str = get_env("AICC_COOKIE", "").strip()
+
+# 平台对批量并发敏感：全局限制同时在途的请求数（登录重试不占用递归名额）
+AICC_MAX_CONCURRENCY = max(
+    1, int(get_env("AICC_MAX_CONCURRENCY", "2").strip() or 2)
+)
+_call_slots = threading.BoundedSemaphore(AICC_MAX_CONCURRENCY)
 
 
 class AiccError(RuntimeError):
@@ -84,17 +91,18 @@ def login() -> str:
             "请在 .env 里补齐账号密码，或从浏览器重新复制 Cookie 到 AICC_COOKIE。",
         )
 
-    with httpx.Client(base_url=BASE_URL, timeout=30, follow_redirects=False, **_skip_proxy()) as client:
-        resp = client.post(
-            "/apiPlatform/entry/login",
-            data={"phoneNumber": phone, "password": encrypt_password(password)},
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json, text/plain, */*",
-                "User-Agent": UA,
-            },
-        )
-        client.cookies  # 触发 cookie 收集
+    with _call_slots:
+        with httpx.Client(base_url=BASE_URL, timeout=30, follow_redirects=False, **_skip_proxy()) as client:
+            resp = client.post(
+                "/apiPlatform/entry/login",
+                data={"phoneNumber": phone, "password": encrypt_password(password)},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": UA,
+                },
+            )
+            client.cookies  # 触发 cookie 收集
 
     try:
         payload = resp.json()
@@ -144,8 +152,9 @@ def request(
         "User-Agent": UA,
         "Cookie": cookie,
     }
-    with httpx.Client(base_url=BASE_URL, timeout=30, follow_redirects=False, **_skip_proxy()) as client:
-        resp = client.request(method.upper(), path, params=params, json=json_body, headers=headers)
+    with _call_slots:
+        with httpx.Client(base_url=BASE_URL, timeout=30, follow_redirects=False, **_skip_proxy()) as client:
+            resp = client.request(method.upper(), path, params=params, json=json_body, headers=headers)
 
     try:
         payload = resp.json()

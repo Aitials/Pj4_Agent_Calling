@@ -59,6 +59,11 @@ DINGTALK_CORP_ID = get_env("DINGTALK_CORP_ID").strip()
 DINGTALK_ROBOT_CODE = get_env("DINGTALK_ROBOT_CODE").strip()
 # 应用标识，预留（Stream 收发不依赖）
 DINGTALK_AGENT_ID = get_env("DINGTALK_AGENT_ID").strip()
+# 卡片平台 → 表单模板 ID；留空用官方公开测试模板，生产必须换成自有模板
+DINGTALK_CARD_TEMPLATE_FORM = (
+    get_env("DINGTALK_CARD_TEMPLATE_FORM").strip()
+    or "280f6d7a-63bc-4905-bf3f-4c6d95e5166b.schema"
+)
 
 # ===== 一知回调安全 =====
 # 时间窗校验，超过窗口的 timestamp 直接拒绝（秒）；0 表示关闭窗口校验

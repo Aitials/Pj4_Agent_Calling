@@ -65,6 +65,9 @@ class Channel(ABC):
 
     name: str
 
+    # 是否支持任务卡片流程（发卡 + 卡片回调）；不支持时工具层直接拒绝
+    supports_cards: bool = False
+
     @abstractmethod
     async def start(self, on_message: MessageHandler) -> None:
         """启动通道并持续接收消息；协程通常不会返回。"""

@@ -16,6 +16,7 @@ import uuid
 import httpx
 
 from app.core.config import (
+    DINGTALK_CARD_TEMPLATE_FORM,
     DINGTALK_CLIENT_ID,
     DINGTALK_CLIENT_SECRET,
     DINGTALK_ROBOT_CODE,
@@ -260,8 +261,18 @@ def _card_request(method: str, path: str, payload: dict) -> bool:
     return False
 
 
-def stream_card(card_instance_id: str, text: str, *, append: bool = False) -> bool:
-    """流式更新 AI 卡片正文；append=False 表示全量替换（默认）。"""
+def stream_card(
+    card_instance_id: str,
+    text: str,
+    *,
+    append: bool = False,
+    finalize: bool = False,
+) -> bool:
+    """流式更新 AI 卡片正文；append=False 表示全量替换（默认）。
+
+    finalize=True 用于收尾：钉钉侧只有收到结束标记才会停止打字机，
+    并以此段内容作为正文最终形态。
+    """
     if not card_instance_id:
         return False
     return _card_request(
@@ -273,7 +284,7 @@ def stream_card(card_instance_id: str, text: str, *, append: bool = False) -> bo
             "key": "msgContent",
             "content": text,
             "isFull": not append,
-            "isFinalize": False,
+            "isFinalize": finalize,
             "isError": False,
         },
     )
@@ -291,6 +302,166 @@ def update_card(card_instance_id: str, card_data: dict) -> bool:
             "cardData": {"cardParamMap": card_data},
         },
     )
+
+
+# AI Markdown 卡片模板的固定渲染顺序；flowStatus 必须是字符串 "3"
+_AI_CARD_ORDER = [
+    "msgTitle",
+    "msgContent",
+    "staticMsgContent",
+    "msgTextList",
+    "msgImages",
+    "msgSlider",
+    "msgButtons",
+]
+
+
+def ai_card_text_data(title: str, text: str) -> dict:
+    """把 AI Markdown 卡替换成纯文本态（按钮操作后收敛卡片）。"""
+    return {
+        "msgTitle": title or "任务卡片",
+        "msgContent": text or "",
+        "staticMsgContent": "",
+        "flowStatus": "3",
+        "sys_full_json_obj": json.dumps(
+            {"order": list(_AI_CARD_ORDER)}, ensure_ascii=False
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 表单卡：模板卡片 + 表单变量（阶段 4 主路径）
+# ---------------------------------------------------------------------------
+
+# 官方文档公开的测试模板；仅开发期使用，生产必须导入自有模板
+PUBLIC_FORM_TEMPLATE_ID = "280f6d7a-63bc-4905-bf3f-4c6d95e5166b.schema"
+_public_template_warned = False
+
+
+def _stringify_card_data(data: dict) -> dict:
+    """cardParamMap 只接受字符串：非字符串统一 JSON 序列化。"""
+    result: dict[str, str] = {}
+    for key, value in data.items():
+        result[str(key)] = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        )
+    return result
+
+
+def create_and_deliver_card(
+    user_id: str,
+    template_id: str,
+    card_data: dict,
+    callback_type: str = "STREAM",
+) -> str:
+    """创建并投放模板卡片，返回 outTrackId；失败抛 RuntimeError。"""
+    user_id = str(user_id or "").strip()
+    template_id = str(template_id or "").strip()
+    if not user_id:
+        raise RuntimeError("钉钉卡片发送失败：缺少 userId")
+    if not template_id:
+        raise RuntimeError("钉钉卡片发送失败：缺少卡片模板 ID")
+
+    out_track_id = f"dt4-{uuid.uuid4().hex}"
+    _openapi_post(
+        "/v1.0/card/instances",
+        {
+            "cardTemplateId": template_id,
+            "outTrackId": out_track_id,
+            "cardData": {"cardParamMap": card_data},
+            "callbackType": callback_type,
+            "imRobotOpenSpaceModel": {"supportForward": False},
+        },
+    )
+    _openapi_post(
+        "/v1.0/card/instances/deliver",
+        {
+            "outTrackId": out_track_id,
+            "userIdType": 1,
+            "openSpaceId": f"dtv1.card//IM_ROBOT.{user_id}",
+            "imRobotOpenDeliverModel": {"spaceType": "IM_ROBOT"},
+        },
+    )
+    log.info(
+        "钉钉卡片已投放 userId=%s template=%s outTrackId=%s",
+        user_id,
+        template_id,
+        out_track_id,
+    )
+    return out_track_id
+
+
+def send_form_card(
+    user_id: str,
+    title: str,
+    fields: list[dict],
+    hidden: dict | None = None,
+    btn_text: str = "提交",
+    template_id: str = "",
+) -> str:
+    """发送表单卡：字段动态传入，隐藏字段用于携带 token/action。"""
+    template = (template_id or DINGTALK_CARD_TEMPLATE_FORM).strip()
+    global _public_template_warned
+    if template == PUBLIC_FORM_TEMPLATE_ID and not _public_template_warned:
+        _public_template_warned = True
+        log.warning(
+            "正在使用钉钉公开测试表单模板，生产请导入自有模板并配置 "
+            "DINGTALK_CARD_TEMPLATE_FORM"
+        )
+
+    all_fields = [dict(item) for item in fields or [] if isinstance(item, dict)]
+    for key, value in (hidden or {}).items():
+        all_fields.append(
+            {
+                "name": str(key),
+                "type": "TEXT",
+                "hidden": True,
+                "defaultValue": value,
+            }
+        )
+
+    card_data = _stringify_card_data(
+        {
+            "title": title or "任务卡片",
+            "form_status": "normal",
+            "form_btn_text": btn_text or "提交",
+            "form": {"fields": all_fields},
+        }
+    )
+    return create_and_deliver_card(user_id, template, card_data)
+
+
+def form_submitted_response(form: dict, current_form: dict) -> dict:
+    """表单提交后的回调响应：回显已填值并把表单置为禁用。
+
+    Stream 模式下 SDK 会把该字典放进 ACK 的 data.response，
+    不需要再调用更新接口，天然满足 2 秒窗口。
+    """
+    form = form or {}
+    current = dict(current_form or {})
+    fields: list[dict] = []
+    for field in current.get("fields") or []:
+        if not isinstance(field, dict):
+            continue
+        item = dict(field)
+        name = item.get("name")
+        if name in form:
+            item["defaultValue"] = form[name]
+        fields.append(item)
+    current["fields"] = fields
+
+    user_private = {
+        "form": current,
+        "form_status": "disabled",
+        "form_btn_text": "已提交",
+    }
+    return {
+        "cardUpdateOptions": {
+            "updateCardDataByKey": True,
+            "updatePrivateDataByKey": True,
+        },
+        "userPrivateData": {"cardParamMap": _stringify_card_data(user_private)},
+    }
 
 
 # ---------------------------------------------------------------------------

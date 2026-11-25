@@ -130,6 +130,16 @@ def create_channel(name: str) -> Channel:
 async def run_channel(name: str) -> None:
     global _AGENT
     channel = create_channel(name)
+
+    # 按通道绑定卡片构造模块：流程层只认 app.cards.cards 代理
+    from app.cards import configure_cards
+
+    if channel.name == "dingtalk":
+        from app.cards import aicc_task_cards_dingtalk as card_module
+    else:
+        from app.cards import aicc_task_cards as card_module
+    configure_cards(card_module)
+
     await init_agent(channel.name)
     setter = getattr(channel, "set_form_handler", None)
     if setter is not None:

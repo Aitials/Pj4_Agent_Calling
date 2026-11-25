@@ -26,15 +26,26 @@ ALL_TOOLS = [
     create_feishu_task,
 ]
 
-# 目前只有飞书通道实现了这些工具：其他渠道不暴露，避免模型调用后才发现不可用
-# 用元组而非集合：StructuredTool 不可哈希
+# 飞书专属：其他渠道一律不暴露
 FEISHU_ONLY = (
-    query_aicc_task_status,
-    open_create_task_form,
-    open_start_task_form,
     find_feishu_member,
     send_feishu_message,
     create_feishu_task,
+)
+
+# 钉钉：通用查询 + 创建 + 启动 + 状态（4.6 全部放行）
+DINGTALK_TOOLS = (
+    query_customer_profile,
+    query_aicc_dashboard,
+    query_aicc_task_status,
+    open_create_task_form,
+    open_start_task_form,
+)
+
+# 企微暂未接入卡片流程，只保留通用查询
+WECOM_TOOLS = (
+    query_customer_profile,
+    query_aicc_dashboard,
 )
 
 
@@ -43,11 +54,15 @@ def tools_for(channel: str) -> list:
     name = (channel or "").strip().lower()
     if not name or name == "feishu":
         return list(ALL_TOOLS)
-    return [tool for tool in ALL_TOOLS if tool not in FEISHU_ONLY]
+    if name == "dingtalk":
+        return list(DINGTALK_TOOLS)
+    return list(WECOM_TOOLS)
 
 __all__ = [
     "ALL_TOOLS",
     "FEISHU_ONLY",
+    "DINGTALK_TOOLS",
+    "WECOM_TOOLS",
     "tools_for",
     "create_feishu_task",
     "find_feishu_member",

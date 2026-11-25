@@ -13,7 +13,7 @@ import asyncio
 import logging
 
 from app.clients import dingtalk_api
-from app.core.config import Settings, get_env
+from app.core.config import DINGTALK_CARD_TEMPLATE_FORM, Settings, get_env
 from app.router import run_channel, setup_logging
 
 log = logging.getLogger("run_dingtalk")
@@ -29,6 +29,12 @@ def main() -> None:
         log.warning(
             "未配置 DINGTALK_ROBOT_CODE，主动推送与降级回复将不可用"
             "（sessionWebhook 被动回复不受影响）"
+        )
+
+    if DINGTALK_CARD_TEMPLATE_FORM == dingtalk_api.PUBLIC_FORM_TEMPLATE_ID:
+        log.warning(
+            "DINGTALK_CARD_TEMPLATE_FORM 仍是官方公开测试模板，"
+            "生产前请导入自有表单模板并替换该配置"
         )
 
     # 提前校验模型与记忆库配置，避免长连接建立后才发现缺配置

@@ -66,8 +66,12 @@ def _open(kind: str) -> str:
 
     channel = get_active_channel()
     message = get_current_message()
-    if channel is None or message is None or getattr(channel, "name", "") != "feishu":
-        return "当前渠道暂不支持表单卡片，请在飞书中操作。"
+    if (
+        channel is None
+        or message is None
+        or not getattr(channel, "supports_cards", False)
+    ):
+        return "当前渠道暂不支持表单卡片。"
 
     if not _has_intent(message.text, kind):
         action = "创建" if kind == "create" else "启动"
@@ -150,8 +154,12 @@ def _open_status(task_keyword: str) -> str:
 
     channel = get_active_channel()
     message = get_current_message()
-    if channel is None or message is None or getattr(channel, "name", "") != "feishu":
-        return "当前渠道暂不支持任务状态卡片，请在飞书中操作。"
+    if (
+        channel is None
+        or message is None
+        or not getattr(channel, "supports_cards", False)
+    ):
+        return "当前渠道暂不支持任务状态卡片。"
 
     if not _has_status_intent(message.text):
         return (

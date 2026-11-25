@@ -9,12 +9,35 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.cards import aicc_task_cards as cards
+from app.cards import cards
 from app.clients import aicc_options
 from app.core import forms
 from app.tools import aicc_task, aicc_task_status
 
 log = logging.getLogger("aicc_flow")
+
+# 概况接口在缓存不可用时会串行调多个一知接口，必须设上限避免卡片流程挂死
+STATUS_OVERVIEW_TIMEOUT = 45.0
+
+# 同一 token + 任务的并发点击只保留一次请求；不同任务按会话串行，
+# 避免 Redis 降级时多个几十秒的查询同时压到一知接口、卡片扎堆发出
+_OVERVIEW_PENDING: set[str] = set()
+_OVERVIEW_CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+_MAX_CHAT_LOCKS = 200
+
+
+def _overview_chat_lock(chat_id: str) -> asyncio.Lock:
+    """按会话取锁；超过上限时先回收空闲锁，避免字典无限增长。"""
+    lock = _OVERVIEW_CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        if len(_OVERVIEW_CHAT_LOCKS) >= _MAX_CHAT_LOCKS:
+            for key in [
+                item for item, value in _OVERVIEW_CHAT_LOCKS.items() if not value.locked()
+            ]:
+                _OVERVIEW_CHAT_LOCKS.pop(key, None)
+        lock = asyncio.Lock()
+        _OVERVIEW_CHAT_LOCKS[chat_id] = lock
+    return lock
 
 
 def _as_list(value) -> list[str]:
@@ -165,7 +188,16 @@ async def _send_status_overview(
     force: bool = False,
 ) -> None:
     try:
-        overview = await asyncio.to_thread(aicc_task_status.build_overview, job_id, force)
+        overview = await asyncio.wait_for(
+            asyncio.to_thread(aicc_task_status.build_overview, job_id, force),
+            timeout=STATUS_OVERVIEW_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        await channel.send_text_to_chat(
+            chat_id,
+            f"读取任务 {job_id} 的运行概况超时，请稍后重试。",
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         await channel.send_text_to_chat(chat_id, f"读取任务 {job_id} 的运行概况失败：{exc}")
         return
@@ -317,14 +349,25 @@ async def handle_action(
                 await channel.send_text_to_chat(chat_id, "任务 ID 无效，请重新选择任务。")
                 return
             filters = record.get("data", {}).get("filters") or {}
-            await _send_status_overview(
-                channel,
-                chat_id,
-                token,
-                int(raw_job_id),
-                filters,
-                force=action == "task_status_refresh",
-            )
+            job_id = int(raw_job_id)
+            pending_key = f"{token}:{job_id}"
+            if pending_key in _OVERVIEW_PENDING:
+                log.info("任务 %s 概况正在读取，忽略重复点击", job_id)
+                return
+            _OVERVIEW_PENDING.add(pending_key)
+            try:
+                # 同一会话的概况请求串行执行，避免多张卡同时返回
+                async with _overview_chat_lock(chat_id):
+                    await _send_status_overview(
+                        channel,
+                        chat_id,
+                        token,
+                        job_id,
+                        filters,
+                        force=action == "task_status_refresh",
+                    )
+            finally:
+                _OVERVIEW_PENDING.discard(pending_key)
             return
         if action == "task_status_back":
             await _status_back(channel, token, value, operator, chat_id)
@@ -354,7 +397,7 @@ async def handle_action(
     except Exception:  # noqa: BLE001
         log.exception("处理卡片动作失败 action=%s", action)
         try:
-            await channel.send_text_to_chat(chat_id, "处理失败，请稍后重试或查看日志。")
+            await channel.send_text_to_chat(chat_id, "处理失败，请稍后重试；若持续失败请联系管理员。")
         except Exception:  # noqa: BLE001
             log.exception("发送失败提示也失败")
 

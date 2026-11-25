@@ -2,9 +2,10 @@
 
 覆盖：
 1. 建卡失败 → start 返回 False（调用方应回退文本）
-2. 时间 + 字数双阈值节流；推送内容单调递增，收尾写入全文
+2. 时间 + 字数双阈值节流；推送内容单调递增，收尾用「全量 + finalize」补正文
 3. 首字前的进度提示
 4. 连续推流失败 → 放弃卡片，finish 返回 False（触发文本兜底）
+5. 达到推流上限后收尾仍补齐尾部内容
 
 用法：
     .venv\\Scripts\\python.exe scripts\\selftest_dingtalk_stream.py
@@ -36,6 +37,7 @@ class FakeCard:
     def __init__(self, *, fail_start: bool = False, fail_stream_after: int | None = None):
         self.card_instance_id = ""
         self.pushed: list[str] = []
+        self.finalized: list[str] = []
         self.finished: str | None = None
         self.failed = False
         self.last_stream_ok = True
@@ -59,6 +61,11 @@ class FakeCard:
             return
         self.last_stream_ok = True
         self.pushed.append(text)
+
+    def ai_streaming_final(self, text: str) -> None:
+        self.ai_streaming(text)
+        if self.last_stream_ok:
+            self.finalized.append(text)
 
     def ai_finish(self, text: str) -> None:
         self.finished = text
@@ -102,6 +109,8 @@ async def case_throttle_and_finish() -> None:
     _check("至少推送一次中间态", len(fake.pushed) >= 1)
     _check("推送内容单调递增", lengths == sorted(lengths))
     _check("节流生效（未把所有中间态都推上去）", len(fake.pushed) < 10)
+    _check("收尾流式推流为全文", fake.pushed[-1] == full)
+    _check("收尾流式带 finalize", fake.finalized[-1] == full)
     _check("收尾写入全文", fake.finished == full)
     _check("收尾成功 → finish True", ok is True)
 
@@ -127,11 +136,49 @@ async def case_stream_failures() -> None:
     _check("连续推流失败 → finish False（走文本兜底）", ok is False)
 
 
+async def case_short_answer_flushes() -> None:
+    """短回答没触发中间推送时，收尾也要用全量 + finalize 补一次正文。"""
+    fake = FakeCard()
+    card = _card(fake, min_interval=0.5, min_chars=20, hint_interval=30)
+    await card.start()
+    card.feed("短回答")
+    ok = await card.finish("短回答")
+    _check("短回答收尾前先推正文", "短回答" in fake.pushed)
+    _check("短回答收尾推流带 finalize", fake.finalized == ["短回答"])
+    _check("短回答收尾成功", ok is True)
+
+
+async def case_cap_flushes_tail() -> None:
+    """中间推流达到上限后，收尾仍要补全文，不能停在上一次快照。"""
+    fake = FakeCard()
+    card = _card(
+        fake,
+        min_interval=0.02,
+        min_chars=1,
+        max_updates=1,
+        max_seconds=30,
+        hint_interval=30,
+    )
+    await card.start()
+    head = "前半段" * 5
+    full = head + "尾巴" * 10
+    card.feed(head)
+    await asyncio.sleep(0.1)
+    card.feed(full)
+    await asyncio.sleep(0.1)
+    ok = await card.finish(full)
+    _check("达到推流上限后中间推流停止", fake.pushed[0] == head)
+    _check("达到上限后收尾仍推全文", fake.finalized[-1] == full)
+    _check("上限后收尾成功", ok is True)
+
+
 async def main() -> int:
     await case_start_failure()
     await case_throttle_and_finish()
     await case_progress_hint()
     await case_stream_failures()
+    await case_short_answer_flushes()
+    await case_cap_flushes_tail()
 
     if _failures:
         print(f"\n=== 失败 {len(_failures)} 项：{', '.join(_failures)} ===")

@@ -206,6 +206,7 @@ class FeishuChannel(Channel):
     """飞书长连接通道。"""
 
     name = "feishu"
+    supports_cards = True
 
     def __init__(self) -> None:
         global _active_channel
