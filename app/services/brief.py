@@ -90,6 +90,26 @@ def build_markdown(record: dict, analysis: dict, profile: dict | None) -> str:
     return "\n".join(lines)
 
 
+def build_plain_text(record: dict, analysis: dict, profile: dict | None) -> str:
+    """生成纯文字简报：去掉 markdown 标记，供钉钉待办简介使用。"""
+    return markdown_to_plain(build_markdown(record, analysis, profile))
+
+
+def markdown_to_plain(text: str) -> str:
+    """把简报 markdown 转成纯文字，保留段落与 `-` 列表。"""
+    lines: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.rstrip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^>\s?", "", line)
+        line = line.replace("**", "").replace("__", "")
+        line = re.sub(r"`([^`]*)`", r"\1", line)
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", line)
+        lines.append(line)
+    plain = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", plain).strip()
+
+
 def save_local(record_id: str, version: int, content: str, company: str = "") -> dict:
     """写入版本文件与 latest 文件，返回路径信息。"""
     BRIEF_DIR.mkdir(parents=True, exist_ok=True)

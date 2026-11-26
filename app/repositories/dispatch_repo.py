@@ -241,8 +241,8 @@ def mark_sent(
     affected = _update(
         "UPDATE `dispatch_notice` "
         "SET `status` = 'SENT', `sent_at` = NOW(), `feishu_task_guid` = %s, "
-        "    `card_message_id` = %s, `todo_id` = %s, `error_msg` = NULL, "
-        "    `next_retry_at` = NULL, `sending_at` = NULL "
+        "    `card_message_id` = %s, `todo_id` = COALESCE(%s, `todo_id`), "
+        "    `error_msg` = NULL, `next_retry_at` = NULL, `sending_at` = NULL "
         "WHERE `id` = %s AND `status` = 'SENDING'",
         (task_guid, message_id, todo_id, int(notice_id)),
     )

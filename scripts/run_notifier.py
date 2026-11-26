@@ -21,7 +21,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.cards.analysis_card import build_analysis_card  # noqa: E402
 from app.cards.high_intent_card import (  # noqa: E402
-    build_dingtalk_analysis_text,
     build_dingtalk_notice_text,
     build_dingtalk_todo_description,
     build_dingtalk_todo_subject,
@@ -279,13 +278,22 @@ def send_analysis_one(notice: dict, max_retry: int) -> bool:
 
 
 def _send_dingtalk_analysis(notice: dict, max_retry: int) -> bool:
-    """钉钉分析通知：不更新原消息，补发一条较短的 markdown。"""
+    """钉钉分析：把纯文字客户简报异步写入待办简介，不再补发第二条消息。"""
     notice_id = int(notice["id"])
     record_id = str(notice.get("trigger_record_id") or "")
     user_id = str(notice.get("assignee_open_id") or "")
+    todo_id = str(notice.get("todo_id") or "").strip()
+
+    if not user_id or not todo_id:
+        reason = (
+            "钉钉分析无法写入：缺少销售 userId"
+            if not user_id
+            else "钉钉分析无法写入：待办 ID 缺失"
+        )
+        _fail_analysis_permanently(notice_id, reason, max_retry)
+        return False
+
     try:
-        if not user_id:
-            raise RuntimeError("钉钉分析通知缺少销售 userId")
         record = call_record_repo.get_call_record(record_id)
         if not record:
             raise RuntimeError(f"通话记录 {record_id} 不存在")
@@ -298,36 +306,78 @@ def _send_dingtalk_analysis(notice: dict, max_retry: int) -> bool:
             "company_name": notice.get("company_name"),
             "trigger_phone": notice.get("trigger_phone"),
         }
-        dingtalk_api.send_bot_message(
-            [user_id],
-            build_dingtalk_analysis_text(view, analysis, notice),
-            markdown=True,
+        profile = customer_repo.get_profile(str(record.get("credit_code") or ""))
+        description = _clip_description(
+            f"{build_dingtalk_todo_description(view, notice)}\n\n"
+            f"【AI 分析报告】\n"
+            f"{brief.build_plain_text(record, analysis, profile)}"
         )
+
+        union = dingtalk_api.union_id(user_id)
+        if not union:
+            raise dingtalk_api.TodoError(
+                f"无法获取销售 {user_id} 的钉钉 unionId，请检查通讯录授权范围"
+            )
+        dingtalk_api.update_todo(union, todo_id, description=description)
+
         dispatch_repo.mark_analysis_sent(notice_id)
-        dispatch_repo.mark_attachment_skipped(notice_id, "钉钉通道本期不支持附件")
+        dispatch_repo.mark_attachment_skipped(
+            notice_id, "分析已写入待办简介，不生成附件"
+        )
         log.info(
-            "钉钉分析通知已发送 notice=%s record=%s analysis=%s",
+            "钉钉分析已写入待办 notice=%s record=%s todo=%s analysis=%s len=%s",
             notice_id,
             record_id,
+            todo_id,
             analysis.get("id"),
+            len(description),
         )
         return True
     except Exception as exc:  # noqa: BLE001
         retry_count = int(notice.get("analysis_retry_count") or 0) + 1
         try:
             dispatch_repo.mark_analysis_failed(
-                notice_id, str(exc), retry_count, max_retry
+                notice_id,
+                str(exc),
+                retry_count=retry_count,
+                max_retry=max_retry,
             )
         except Exception:  # noqa: BLE001
             log.exception("标记钉钉分析通知失败时又失败 notice=%s", notice_id)
         log.warning(
-            "钉钉分析通知失败 notice=%s record=%s retry=%s：%s",
+            "钉钉分析写入待办失败 notice=%s record=%s retry=%s：%s",
             notice_id,
             record_id,
             retry_count,
             exc,
         )
         return False
+
+
+def _fail_analysis_permanently(notice_id: int, reason: str, max_retry: int) -> None:
+    """不可重试的分析失败：直接置 FAILED 并告警，避免无意义重试。"""
+    try:
+        dispatch_repo.mark_analysis_failed(
+            notice_id,
+            reason,
+            retry_count=max_retry,
+            max_retry=max_retry,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("标记钉钉分析永久失败时又失败 notice=%s", notice_id)
+    log.error("钉钉分析永久失败 notice=%s：%s", notice_id, reason)
+
+
+DESCRIPTION_LIMIT = 4096
+
+
+def _clip_description(text: str, limit: int = DESCRIPTION_LIMIT) -> str:
+    """按钉钉待办描述上限截断，优先保留前面的基础信息与分析结论。"""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n（内容过长，已截断）"
+    return text[: max(0, limit - len(suffix))] + suffix
 
 
 def attach_brief_one(notice: dict, max_retry: int) -> bool:

@@ -568,6 +568,21 @@ class TodoQuotaExceeded(RuntimeError):
     """当日待办数量达到上限（400002），重试无意义。"""
 
 
+def _todo_error_is_duplicate(text: str) -> bool:
+    """判断待办错误是否表示「已经创建过」。
+
+    钉钉有两种表现：
+    - 400001：当天已有相同内容待办；
+    - HTTP 400 + code=todo.taskCreate.paramError + message 含
+      "task existed sourceId is xxx"：同一 sourceId 重复创建。
+    两种都按已创建处理，避免重试风暴。
+    """
+    lowered = (text or "").lower()
+    if "400001" in lowered:
+        return True
+    return "task existed" in lowered and "sourceid" in lowered
+
+
 def _todo_request(method: str, path: str, payload: dict) -> dict:
     """待办接口调用：区分「当天重复内容」与「当日上限」，其余按可重试处理。"""
     last_error = "未知错误"
@@ -598,8 +613,8 @@ def _todo_request(method: str, path: str, payload: dict) -> dict:
         text = _format_error(response.status_code, data)
         last_error = text
         # 官方防骚扰限制：400001 当天已有相同内容待办；400002 当天待办数量上限
-        if "400001" in text:
-            log.info("钉钉待办当天已存在相同内容，按已创建处理：%s", text)
+        if _todo_error_is_duplicate(text):
+            log.info("钉钉待办已存在，按已创建处理：%s", text)
             return {"_duplicated": True}
         if "400002" in text:
             raise TodoQuotaExceeded(f"钉钉待办今日已达上限：{text}")
@@ -648,5 +663,45 @@ def create_todo(
         "url": str(data.get("detailUrl") or data.get("url") or ""),
         "duplicated": False,
     }
+
+
+# 钉钉待办描述最大 4096 字符
+TODO_DESCRIPTION_LIMIT = 4096
+
+
+def update_todo(
+    union_id: str,
+    task_id: str,
+    *,
+    description: str,
+    subject: str = "",
+) -> None:
+    """更新待办标题/描述；失败抛 RuntimeError，由调用方决定重试。
+
+    只传需要更新的字段，未传的 subject/dueTime/done 保持不变。
+    """
+    union_id = str(union_id or "").strip()
+    task_id = str(task_id or "").strip()
+    if not union_id:
+        raise ValueError("更新钉钉待办缺少 unionId")
+    if not task_id:
+        raise ValueError("更新钉钉待办缺少 taskId")
+
+    text = str(description or "")
+    if len(text) > TODO_DESCRIPTION_LIMIT:
+        suffix = "\n\n（内容过长，已截断）"
+        text = text[: TODO_DESCRIPTION_LIMIT - len(suffix)] + suffix
+
+    payload: dict = {"description": text}
+    if subject:
+        payload["subject"] = str(subject)[:1024]
+
+    _openapi_request(
+        "PUT",
+        f"/v1.0/todo/users/{union_id}/tasks/{task_id}",
+        params={"operatorId": union_id},
+        payload=payload,
+    )
+    log.info("钉钉待办已更新 taskId=%s description_len=%s", task_id, len(text))
 
 

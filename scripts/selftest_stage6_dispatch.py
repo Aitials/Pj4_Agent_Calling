@@ -235,25 +235,123 @@ def test_dingtalk_analysis() -> None:
         p.set(
             run_notifier.analysis_repo,
             "get_current",
-            lambda rid: {"id": 5, "intent_level": "HIGH", "reason": "要报价", "next_action": "回电"},
+            lambda rid: {
+                "id": 5,
+                "intent_level": "HIGH",
+                "reason": "要报价",
+                "next_action": "回电",
+                "customer_needs": ["报价单"],
+            },
+        )
+        p.set(run_notifier.customer_repo, "get_profile", lambda code: {})
+        p.set(run_notifier.dingtalk_api, "union_id", lambda uid: "union-1")
+        p.set(
+            run_notifier.dingtalk_api,
+            "update_todo",
+            lambda union, task_id, **kw: cap.update(
+                union=union, task_id=task_id, description=kw.get("description", "")
+            ),
         )
         p.set(
             run_notifier.dingtalk_api,
             "send_bot_message",
-            lambda ids, text, markdown=False: cap.update(text=text),
+            lambda *args, **kwargs: cap.update(unexpected_message=True),
         )
-        p.set(run_notifier.dispatch_repo, "mark_analysis_sent", lambda nid: cap.update(sent=nid))
+        p.set(
+            run_notifier.dispatch_repo,
+            "mark_analysis_sent",
+            lambda nid: cap.update(sent=nid),
+        )
         p.set(
             run_notifier.dispatch_repo,
             "mark_attachment_skipped",
             lambda nid, reason="": cap.update(skipped=(nid, reason)),
         )
-        analysis_ok = run_notifier._send_dingtalk_analysis(_notice(), 3)
+        analysis_ok = run_notifier._send_dingtalk_analysis(
+            _notice(todo_id="todo-1"), 3
+        )
     finally:
         p.restore()
-    _check("钉钉分析通知发送成功", analysis_ok is True and cap.get("sent") == 11)
+
+    desc = str(cap.get("description") or "")
+    _check("钉钉分析写入待办成功", analysis_ok is True and cap.get("sent") == 11)
+    _check("更新的是原待办", cap.get("task_id") == "todo-1")
+    _check("简介包含基础信息", "企业：" in desc and "电话：" in desc)
+    _check("简介包含 AI 分析报告", "【AI 分析报告】" in desc)
+    _check("简介已转纯文字", "#" not in desc and "**" not in desc)
+    _check("不再补发第二条消息", not cap.get("unexpected_message"))
     _check("钉钉附件直接跳过", cap.get("skipped", ("", ""))[0] == 11)
-    _check("分析文案包含 AI 分析", "AI 分析" in str(cap.get("text")))
+
+
+def test_dingtalk_analysis_missing_todo() -> None:
+    p = _Patcher()
+    cap: dict = {}
+    try:
+        p.set(
+            run_notifier.dingtalk_api,
+            "update_todo",
+            lambda *args, **kwargs: cap.update(updated=True),
+        )
+        p.set(
+            run_notifier.dispatch_repo,
+            "mark_analysis_failed",
+            lambda *args, **kwargs: cap.update(args=args, kw=kwargs),
+        )
+        ok = run_notifier._send_dingtalk_analysis(_notice(todo_id=""), 3)
+    finally:
+        p.restore()
+    _check("缺待办时分析失败", ok is False and not cap.get("updated"))
+    _check(
+        "缺待办直接置 FAILED 不重试",
+        cap.get("kw", {}).get("retry_count") == 3
+        and cap.get("kw", {}).get("max_retry") == 3,
+    )
+
+
+def test_dingtalk_analysis_update_failure() -> None:
+    p = _Patcher()
+    cap: dict = {}
+    try:
+        p.set(run_notifier.call_record_repo, "get_call_record", lambda rid: _record(rid))
+        p.set(
+            run_notifier.analysis_repo,
+            "get_current",
+            lambda rid: {"id": 5, "intent_level": "HIGH", "reason": "要报价"},
+        )
+        p.set(run_notifier.customer_repo, "get_profile", lambda code: {})
+        p.set(run_notifier.dingtalk_api, "union_id", lambda uid: "union-1")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("待办更新失败")
+
+        p.set(run_notifier.dingtalk_api, "update_todo", _boom)
+        p.set(
+            run_notifier.dispatch_repo,
+            "mark_analysis_failed",
+            lambda *args, **kwargs: cap.update(args=args, kw=kwargs),
+        )
+        ok = run_notifier._send_dingtalk_analysis(_notice(todo_id="todo-1"), 3)
+    finally:
+        p.restore()
+    _check("待办更新失败返回失败", ok is False)
+    _check(
+        "待办更新失败按可重试处理",
+        cap.get("kw", {}).get("retry_count") == 1,
+    )
+
+
+def test_plain_brief_and_truncation() -> None:
+    from app.services import brief
+
+    text = brief.build_plain_text(
+        {**_record("rec-1"), "asr_transcript": "客户：你好\n销售：您好"},
+        {"id": 1, "intent_level": "HIGH", "reason": "要报价", "version": 1},
+        None,
+    )
+    _check("简报纯文字不含 markdown 标记", "#" not in text and "**" not in text)
+    clipped = run_notifier._clip_description("x" * 5000)
+    _check("待办描述不超过 4096", len(clipped) <= 4096)
+    _check("超长描述带截断提示", "已截断" in clipped)
 
 
 def test_attachment_guard() -> None:
@@ -270,6 +368,25 @@ def test_attachment_guard() -> None:
         p.restore()
     _check("钉钉附件链路直接返回成功", ok is True)
     _check("附件状态标记 SKIPPED", "附件" in str(cap.get("reason")))
+
+
+def test_todo_error_classification() -> None:
+    from app.clients import dingtalk_api
+
+    _check(
+        "待办 400001 识别为已存在",
+        dingtalk_api._todo_error_is_duplicate("code=400001 message=duplicated"),
+    )
+    _check(
+        "待办 sourceId 重复识别为已存在",
+        dingtalk_api._todo_error_is_duplicate(
+            "code=todo.taskCreate.paramError message=task existed sourceId is notice-10"
+        ),
+    )
+    _check(
+        "普通待办错误不误判",
+        not dingtalk_api._todo_error_is_duplicate("http=500 网络抖动"),
+    )
 
 
 def test_tool_gate() -> None:
@@ -290,7 +407,11 @@ def main() -> int:
     test_dingtalk_quota_not_retried()
     test_dingtalk_generic_failure_retries()
     test_dingtalk_analysis()
+    test_dingtalk_analysis_missing_todo()
+    test_dingtalk_analysis_update_failure()
+    test_plain_brief_and_truncation()
     test_attachment_guard()
+    test_todo_error_classification()
     test_tool_gate()
     print()
     if _failures:
