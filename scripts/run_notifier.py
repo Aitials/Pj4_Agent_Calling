@@ -21,11 +21,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.cards.analysis_card import build_analysis_card  # noqa: E402
 from app.cards.high_intent_card import (  # noqa: E402
+    build_dingtalk_analysis_text,
+    build_dingtalk_notice_text,
+    build_dingtalk_todo_description,
+    build_dingtalk_todo_subject,
     build_high_intent_card,
     build_task_description,
     build_task_summary,
 )
-from app.clients import feishu_api  # noqa: E402
+from app.clients import dingtalk_api, feishu_api  # noqa: E402
+from app.core.config import CHANNEL  # noqa: E402
 from app.repositories import (  # noqa: E402
     analysis_repo,
     call_record_repo,
@@ -97,36 +102,126 @@ def send_one(notice: dict, max_retry: int) -> bool:
         )
         return True
     except Exception as exc:  # noqa: BLE001
-        retry_count = int(notice.get("retry_count") or 0) + 1
-        next_retry_at = None
-        if retry_count < max_retry:
-            delay = BACKOFF_SECONDS[min(retry_count - 1, len(BACKOFF_SECONDS) - 1)]
-            next_retry_at = datetime.now() + timedelta(seconds=delay)
+        return _mark_failed_with_retry(notice, exc, max_retry, task_guid=task_guid)
+
+
+def send_notice(notice: dict, max_retry: int) -> bool:
+    """按通知自带的 channel 分发：切通道后旧队列仍走原渠道。"""
+    channel = str(notice.get("channel") or "feishu").strip().lower()
+    if channel == "dingtalk":
+        return send_dingtalk_one(notice, max_retry)
+    return send_one(notice, max_retry)
+
+
+def send_dingtalk_one(notice: dict, max_retry: int) -> bool:
+    """钉钉派单：建待办 + 私聊 markdown；本期不处理附件。"""
+    notice_id = int(notice["id"])
+    record_id = str(notice.get("trigger_record_id") or "")
+    user_id = str(notice.get("assignee_open_id") or "")
+    todo_id = str(notice.get("todo_id") or "")
+
+    try:
+        if not user_id:
+            raise RuntimeError("钉钉通知缺少销售 userId")
+        record = call_record_repo.get_call_record(record_id)
+        if not record:
+            raise RuntimeError(f"通话记录 {record_id} 不存在")
+
+        view = {
+            **record,
+            "company_name": notice.get("company_name"),
+            "trigger_phone": notice.get("trigger_phone"),
+        }
+
+        if not todo_id:
+            union = dingtalk_api.union_id(user_id)
+            if not union:
+                raise dingtalk_api.TodoError(
+                    f"无法获取销售 {user_id} 的钉钉 unionId，请检查通讯录授权范围"
+                )
+            result = dingtalk_api.create_todo(
+                union,
+                build_dingtalk_todo_subject(view),
+                description=build_dingtalk_todo_description(view, notice),
+                source_id=f"notice-{notice_id}",
+            )
+            todo_id = str(result.get("id") or "")
+
+        dingtalk_api.send_bot_message(
+            [user_id], build_dingtalk_notice_text(view, notice), markdown=True
+        )
+        dispatch_repo.mark_sent(notice_id, None, None, todo_id=todo_id or None)
+        log.info(
+            "钉钉通知已发送 notice=%s record=%s assignee=%s todo=%s",
+            notice_id,
+            record_id,
+            notice.get("assignee_name") or user_id,
+            todo_id or "-",
+        )
+        return True
+    except dingtalk_api.TodoQuotaExceeded as exc:
+        # 当日 100 条上限：重试无意义，直接置 FAILED 等人工处理
         try:
             dispatch_repo.mark_failed(
                 notice_id,
                 str(exc),
-                retry_count,
-                next_retry_at,
-                task_guid=task_guid,
+                retry_count=max_retry,
+                next_retry_at=None,
+                todo_id=todo_id or None,
             )
         except Exception:  # noqa: BLE001
-            log.exception("标记通知失败时又失败 notice=%s", notice_id)
-        log.warning(
-            "通知发送失败 notice=%s record=%s retry=%s next=%s：%s",
-            notice_id,
-            record_id,
-            retry_count,
-            next_retry_at,
-            exc,
-        )
+            log.exception("标记钉钉通知失败时又失败 notice=%s", notice_id)
+        log.error("钉钉待办达到当日上限 notice=%s：%s", notice_id, exc)
         return False
+    except Exception as exc:  # noqa: BLE001
+        return _mark_failed_with_retry(
+            notice, exc, max_retry, todo_id=todo_id or None
+        )
+
+
+def _mark_failed_with_retry(
+    notice: dict,
+    exc: Exception,
+    max_retry: int,
+    task_guid: str | None = None,
+    todo_id: str | None = None,
+) -> bool:
+    """失败回写：未超限回到 PENDING 并按退避重试。"""
+    notice_id = int(notice["id"])
+    record_id = str(notice.get("trigger_record_id") or "")
+    retry_count = int(notice.get("retry_count") or 0) + 1
+    next_retry_at = None
+    if retry_count < max_retry:
+        delay = BACKOFF_SECONDS[min(retry_count - 1, len(BACKOFF_SECONDS) - 1)]
+        next_retry_at = datetime.now() + timedelta(seconds=delay)
+    try:
+        dispatch_repo.mark_failed(
+            notice_id,
+            str(exc),
+            retry_count=retry_count,
+            next_retry_at=next_retry_at,
+            task_guid=task_guid,
+            todo_id=todo_id,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("标记通知失败时又失败 notice=%s", notice_id)
+    log.warning(
+        "通知发送失败 notice=%s record=%s retry=%s next=%s：%s",
+        notice_id,
+        record_id,
+        retry_count,
+        next_retry_at,
+        exc,
+    )
+    return False
 
 
 def send_analysis_one(notice: dict, max_retry: int) -> bool:
     """发送分析结果通知：优先原地更新基础卡片，失败或消息不存在则补发。"""
     notice_id = int(notice["id"])
     record_id = str(notice.get("trigger_record_id") or "")
+    if str(notice.get("channel") or "feishu").strip().lower() == "dingtalk":
+        return _send_dingtalk_analysis(notice, max_retry)
     try:
         record = call_record_repo.get_call_record(record_id)
         if not record:
@@ -183,6 +278,58 @@ def send_analysis_one(notice: dict, max_retry: int) -> bool:
         return False
 
 
+def _send_dingtalk_analysis(notice: dict, max_retry: int) -> bool:
+    """钉钉分析通知：不更新原消息，补发一条较短的 markdown。"""
+    notice_id = int(notice["id"])
+    record_id = str(notice.get("trigger_record_id") or "")
+    user_id = str(notice.get("assignee_open_id") or "")
+    try:
+        if not user_id:
+            raise RuntimeError("钉钉分析通知缺少销售 userId")
+        record = call_record_repo.get_call_record(record_id)
+        if not record:
+            raise RuntimeError(f"通话记录 {record_id} 不存在")
+        analysis = analysis_repo.get_current(record_id)
+        if not analysis:
+            raise RuntimeError(f"通话 {record_id} 暂无分析结果")
+
+        view = {
+            **record,
+            "company_name": notice.get("company_name"),
+            "trigger_phone": notice.get("trigger_phone"),
+        }
+        dingtalk_api.send_bot_message(
+            [user_id],
+            build_dingtalk_analysis_text(view, analysis, notice),
+            markdown=True,
+        )
+        dispatch_repo.mark_analysis_sent(notice_id)
+        dispatch_repo.mark_attachment_skipped(notice_id, "钉钉通道本期不支持附件")
+        log.info(
+            "钉钉分析通知已发送 notice=%s record=%s analysis=%s",
+            notice_id,
+            record_id,
+            analysis.get("id"),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        retry_count = int(notice.get("analysis_retry_count") or 0) + 1
+        try:
+            dispatch_repo.mark_analysis_failed(
+                notice_id, str(exc), retry_count, max_retry
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("标记钉钉分析通知失败时又失败 notice=%s", notice_id)
+        log.warning(
+            "钉钉分析通知失败 notice=%s record=%s retry=%s：%s",
+            notice_id,
+            record_id,
+            retry_count,
+            exc,
+        )
+        return False
+
+
 def attach_brief_one(notice: dict, max_retry: int) -> bool:
     """生成简报 → 本地留档 → 上传附件 → 更新任务描述。
 
@@ -190,6 +337,9 @@ def attach_brief_one(notice: dict, max_retry: int) -> bool:
     """
     notice_id = int(notice["id"])
     record_id = str(notice.get("trigger_record_id") or "")
+    if str(notice.get("channel") or "feishu").strip().lower() == "dingtalk":
+        dispatch_repo.mark_attachment_skipped(notice_id, "钉钉通道本期不支持附件")
+        return True
     task_guid = str(notice.get("feishu_task_guid") or "").strip()
     try:
         if not task_guid:
@@ -253,6 +403,21 @@ def attach_brief_one(notice: dict, max_retry: int) -> bool:
         return False
 
 
+def check_assignees() -> None:
+    """启动时打印各渠道可派人数；当前渠道为 0 时显式告警。"""
+    for channel in ("feishu", "dingtalk"):
+        try:
+            count = len(dispatch_repo.list_enabled_assignees(channel))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("检查 %s 可派销售失败：%s", channel, exc)
+            continue
+        log.info("%s 可派销售 %s 人", channel, count)
+        if channel == CHANNEL and count == 0:
+            log.error(
+                "当前 CHANNEL=%s 但没有可派销售，请先维护 sales_assignee", channel
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="发送高意向通知队列")
     parser.add_argument("--interval", type=int, default=5, help="扫描间隔（秒）")
@@ -265,6 +430,7 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging()
+    check_assignees()
     reclaimed = dispatch_repo.reclaim_sending()
     if reclaimed:
         log.info("回收 SENDING 超时记录 %s 条", reclaimed)
@@ -297,7 +463,7 @@ def main() -> int:
         if notices:
             log.info("本轮抢占 %s 条通知", len(notices))
         for notice in notices:
-            send_one(notice, max(1, int(args.max_retry or 3)))
+            send_notice(notice, max(1, int(args.max_retry or 3)))
 
         analysis_notices = dispatch_repo.claim_analysis_pending(
             args.batch, max(1, int(args.max_retry or 3))

@@ -219,14 +219,16 @@ async def case_status_pick_guard() -> None:
 
         state["jobs"].clear()
         state["peak"] = 0
+        # 4.8 起一张卡只认一次动作：这里用两张不同的卡模拟「不同任务快速点击」，
+        # 继续验证同一会话内的概况查询仍然串行执行。
         await asyncio.gather(
             aicc_task_flow.handle_action(
                 channel, "task_status_pick", {"token": token, "job_id": "43"},
-                {}, "user-1", "user-1", "card-list-1",
+                {}, "user-1", "user-1", "card-list-2",
             ),
             aicc_task_flow.handle_action(
                 channel, "task_status_pick", {"token": token, "job_id": "44"},
-                {}, "user-1", "user-1", "card-list-1",
+                {}, "user-1", "user-1", "card-list-3",
             ),
         )
         _check(

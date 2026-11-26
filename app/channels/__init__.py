@@ -15,23 +15,29 @@ if TYPE_CHECKING:  # 避免循环导入
 
 _lock = threading.Lock()
 _channels: dict[str, "Channel"] = {}
+# 最近登记的通道即当前运行通道：单进程只跑一个通道
+_active_name = ""
 
 _current_message: ContextVar = ContextVar("current_message", default=None)
 
 
 def register_channel(channel: "Channel") -> None:
     """通道实例化后登记，供工具层判断当前渠道能力。"""
+    global _active_name
     name = str(getattr(channel, "name", "") or "")
     if not name:
         return
     with _lock:
         _channels[name] = channel
+        _active_name = name
 
 
 def get_channel(name: str = "") -> "Channel | None":
     with _lock:
         if name:
             return _channels.get(name)
+        if _active_name:
+            return _channels.get(_active_name)
         return next(iter(_channels.values()), None)
 
 

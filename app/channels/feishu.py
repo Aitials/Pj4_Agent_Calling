@@ -48,8 +48,6 @@ from lark_oapi.api.im.v1 import (
 )
 
 from app.channels import (
-    get_active_channel as _registry_active_channel,
-    get_current_message as _registry_current_message,
     register_channel,
     reset_current_message,
     set_current_message,
@@ -88,9 +86,6 @@ _DEFAULT_SUFFIX = {
     "video": ".mp4",
     "file": ".bin",
 }
-
-_active_channel: "FeishuChannel | None" = None
-
 
 def _safe_name(name: str) -> str:
     """把文件名压成安全的单段名称。"""
@@ -193,13 +188,16 @@ def _stream_card_json() -> str:
     return json.dumps(card, ensure_ascii=False)
 
 
-def get_active_channel() -> "FeishuChannel | None":
-    # 兼容旧调用：统一走通道注册表
-    return _registry_active_channel() or _active_channel
-
-
-def get_current_message() -> IncomingMessage | None:
-    return _registry_current_message()
+def _processing_card(text: str) -> dict:
+    """卡片回调响应里的「处理中」卡：置灰并去掉按钮，避免继续连点。"""
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "处理中"},
+            "template": "grey",
+        },
+        "body": {"elements": [{"tag": "markdown", "content": text}]},
+    }
 
 
 class FeishuChannel(Channel):
@@ -209,7 +207,6 @@ class FeishuChannel(Channel):
     supports_cards = True
 
     def __init__(self) -> None:
-        global _active_channel
         if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
             raise SystemExit("缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请先在 .env 中配置")
 
@@ -228,7 +225,6 @@ class FeishuChannel(Channel):
         self._ws_thread: threading.Thread | None = None
         # 任务表单卡片回调处理，由 router 注入
         self._form_handler: Any = None
-        _active_channel = self
         register_channel(self)
 
     # ------------------------------------------------------------------ 启动
@@ -513,17 +509,22 @@ class FeishuChannel(Channel):
             self._loop,
         )
 
+        # 通道层只做「视觉失效」：真正的 first-wins 由业务层
+        # forms.consume_card_action 统一处理。这里不再消费同一个闸门，
+        # 否则正常点击会被二次消费挡掉。
+        if action in ("task_status_pick", "task_status_refresh"):
+            response.toast = CallBackToast(
+                {"type": "success", "content": "已提交，正在读取任务概况"}
+            )
+            response.card = CallBackCard(
+                {"type": "raw", "data": _processing_card("已提交，正在读取任务概况…")}
+            )
+            return response
+
         if action.endswith("_confirm") or action.endswith("_step1") or action.endswith("_step2"):
             response.toast = CallBackToast({"type": "success", "content": "已提交，正在处理"})
             response.card = CallBackCard(
-                {
-                    "type": "raw",
-                    "data": {
-                        "schema": "2.0",
-                        "header": {"title": {"tag": "plain_text", "content": "处理中"}, "template": "grey"},
-                        "body": {"elements": [{"tag": "markdown", "content": "已提交，请稍候…"}]},
-                    },
-                }
+                {"type": "raw", "data": _processing_card("已提交，请稍候…")}
             )
         else:
             response.toast = CallBackToast({"type": "info", "content": "正在刷新…"})

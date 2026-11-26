@@ -15,6 +15,11 @@ import uuid
 
 FORM_TTL_SECONDS = 900
 
+# 卡片「一次性动作」去重：一张卡只消费一次，连点/重投都只认第一次。
+# 键是平台消息 ID（钉钉 outTrackId / 飞书 open_message_id），与具体 token 无关。
+_CARD_ACTION_TTL_SECONDS = 3600.0
+_card_actions: dict[str, float] = {}
+
 _lock = threading.Lock()
 _records: dict[str, dict] = {}
 
@@ -75,6 +80,26 @@ def update(token: str, *, step: str | None = None, data: dict | None = None) -> 
         if data is not None:
             item["data"] = dict(data)
         return dict(item)
+
+
+def consume_card_action(card_id: str) -> bool:
+    """卡片级一次性动作闸门：第一次返回 True，同一张卡再次点击返回 False。
+
+    用于「查看详情/刷新」这类每张卡只能生效一次的动作。校验与写入在同一把
+    锁内完成，两个并发回调只有一个能拿到 True，从业务层保证 first-wins。
+    """
+    card_id = str(card_id or "").strip()
+    if not card_id:
+        return False
+    now = time.monotonic()
+    with _lock:
+        for key, expires in list(_card_actions.items()):
+            if expires <= now:
+                _card_actions.pop(key, None)
+        if card_id in _card_actions:
+            return False
+        _card_actions[card_id] = now + _CARD_ACTION_TTL_SECONDS
+        return True
 
 
 def pop_for(token: str, operator: str = "") -> tuple[dict | None, str]:

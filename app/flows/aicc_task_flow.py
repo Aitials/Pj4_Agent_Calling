@@ -340,6 +340,11 @@ async def handle_action(
             await _status_page(channel, token, value, operator, chat_id)
             return
         if action in ("task_status_pick", "task_status_refresh"):
+            # 卡片级一次性闸门：一张卡只认第一次点击，连点/重投全部丢弃。
+            # 放在所有校验之前，保证「宣布失效」不依赖任何卡片更新接口是否成功。
+            if message_id and not forms.consume_card_action(message_id):
+                log.info("卡片重复点击已丢弃 action=%s message=%s", action, message_id)
+                return
             record = _require_record(token, operator, "status")
             if not record:
                 await channel.send_text_to_chat(chat_id, "这张卡片已过期，请重新发起任务状态查询。")

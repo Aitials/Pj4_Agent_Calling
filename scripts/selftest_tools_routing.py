@@ -45,6 +45,7 @@ def test_feishu() -> None:
     tools = tools_for("feishu")
     _check("飞书暴露全部工具", len(tools) == len(ALL_TOOLS))
     _check("飞书包含任务状态卡片工具", "query_aicc_task_status" in _names(tools))
+    _check("飞书不暴露钉钉待办工具", "create_dingtalk_todo" not in _names(tools))
 
 
 def test_dingtalk() -> None:
@@ -54,6 +55,7 @@ def test_dingtalk() -> None:
     _check("钉钉暴露创建任务卡片", "open_create_task_form" in names)
     _check("钉钉暴露启动任务卡片", "open_start_task_form" in names)
     _check("钉钉暴露状态查询卡片", "query_aicc_task_status" in names)
+    _check("钉钉暴露待办工具", "create_dingtalk_todo" in names)
     _check("钉钉不暴露飞书专属工具", not (names & _names(FEISHU_ONLY)))
     _check(
         "钉钉保留通用查询工具",

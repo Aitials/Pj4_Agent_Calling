@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from app.core.config import CHANNEL
 from app.repositories import call_record_repo, customer_repo, dispatch_repo, lead_brief_repo
 from app.services import intent
 
@@ -66,9 +67,13 @@ def persist_record(
             if dispatch_repo.get_notice_by_record(record_id, conn=conn, for_update=True):
                 log.info("通话 %s 已存在通知记录，跳过派单", record_id)
             else:
-                assignee = dispatch_repo.next_assignee(conn=conn)
+                assignee = dispatch_repo.next_assignee(channel=CHANNEL, conn=conn)
                 if not assignee:
-                    log.warning("销售名单为空，通话 %s 无法派单", record_id)
+                    log.warning(
+                        "销售名单为空，通话 %s 无法派单（channel=%s）",
+                        record_id,
+                        CHANNEL,
+                    )
 
         if assignee:
             notice = {
@@ -76,8 +81,9 @@ def persist_record(
                 "company_name": company_name,
                 "trigger_record_id": record_id,
                 "trigger_phone": record.get("customer_phone"),
-                "assignee_open_id": assignee["open_id"],
+                "assignee_open_id": assignee["user_id"],
                 "assignee_name": assignee.get("name"),
+                "channel": CHANNEL,
                 "trigger_source": trigger_source,
                 "notice_date": date.today(),
             }

@@ -329,6 +329,20 @@ def ai_card_text_data(title: str, text: str) -> dict:
     }
 
 
+def button_card_consumed_response(text: str = "已处理，请查看最新消息。") -> dict:
+    """按钮点击后的 ACK 响应：把 AI 卡原地换成无按钮的失效态。
+
+    Stream 模式下 SDK 会把本字典放进 ACK 的 data.response，卡片随 ACK 一起
+    更新，不再额外调 update_card —— 既满足 2 秒窗口，又从根上避免「异步
+    update 与发新卡并发写同一张卡」导致的客户端重载态。
+    """
+    card_data = ai_card_text_data("任务卡片", text)
+    return {
+        "cardUpdateOptions": {"updateCardDataByKey": True},
+        "cardData": {"cardParamMap": _stringify_card_data(card_data)},
+    }
+
+
 # ---------------------------------------------------------------------------
 # 表单卡：模板卡片 + 表单变量（阶段 4 主路径）
 # ---------------------------------------------------------------------------
@@ -539,5 +553,100 @@ def union_id(user_id: str) -> str:
     _cache_union(user_id, fetched, UNION_ID_CACHE_TTL)
     log.info("钉钉 unionId 转换成功 userId=%s", user_id)
     return fetched
+
+
+# ---------------------------------------------------------------------------
+# 待办：派单与 Agent 建待办共用（需要 unionId，权限 Todo.Todo.Write）
+# ---------------------------------------------------------------------------
+
+
+class TodoError(RuntimeError):
+    """待办接口可重试失败（网络/5xx/限流之外的临时异常）。"""
+
+
+class TodoQuotaExceeded(RuntimeError):
+    """当日待办数量达到上限（400002），重试无意义。"""
+
+
+def _todo_request(method: str, path: str, payload: dict) -> dict:
+    """待办接口调用：区分「当天重复内容」与「当日上限」，其余按可重试处理。"""
+    last_error = "未知错误"
+    for attempt in range(2):
+        token = access_token(force=attempt > 0)
+        if not token:
+            raise TodoError("钉钉 accessToken 获取失败，无法创建待办")
+        try:
+            with _http_client() as client:
+                response = client.request(
+                    method,
+                    path,
+                    headers={"x-acs-dingtalk-access-token": token},
+                    json=payload,
+                )
+                data = _json(response)
+        except Exception as exc:  # noqa: BLE001
+            raise TodoError(f"钉钉待办接口请求失败：{exc}") from exc
+
+        if response.status_code == 401 and attempt == 0:
+            log.info("钉钉 accessToken 失效，刷新后重试 path=%s", path)
+            continue
+
+        code = str(data.get("code") or "")
+        if response.status_code < 400 and code in ("", "0"):
+            return data
+
+        text = _format_error(response.status_code, data)
+        last_error = text
+        # 官方防骚扰限制：400001 当天已有相同内容待办；400002 当天待办数量上限
+        if "400001" in text:
+            log.info("钉钉待办当天已存在相同内容，按已创建处理：%s", text)
+            return {"_duplicated": True}
+        if "400002" in text:
+            raise TodoQuotaExceeded(f"钉钉待办今日已达上限：{text}")
+        raise TodoError(f"钉钉待办接口失败：{text}")
+    raise TodoError(f"钉钉待办接口失败：{last_error}")
+
+
+def create_todo(
+    union_id: str,
+    subject: str,
+    *,
+    description: str = "",
+    source_id: str = "",
+    due_ms: int | None = None,
+) -> dict:
+    """创建钉钉待办，返回 {"id", "url", "duplicated"}。
+
+    sourceId 用于业务幂等；同一通电话重试时内容与 sourceId 保持一致，
+    即使前一次创建成功但没来得及落库，也会命中 400001 按已创建处理。
+    """
+    union_id = str(union_id or "").strip()
+    subject = str(subject or "").strip()
+    if not union_id:
+        raise ValueError("创建钉钉待办缺少 unionId")
+    if not subject:
+        raise ValueError("创建钉钉待办缺少标题")
+
+    payload: dict = {
+        "subject": subject[:1024],
+        "description": str(description or "")[:4096],
+        "executorIds": [union_id],
+        "participantIds": [],
+    }
+    if source_id:
+        payload["sourceId"] = str(source_id)[:64]
+    if due_ms:
+        payload["dueTime"] = int(due_ms)
+
+    data = _todo_request(
+        "POST", f"/v1.0/todo/users/{union_id}/tasks", payload
+    )
+    if data.get("_duplicated"):
+        return {"id": "", "url": "", "duplicated": True}
+    return {
+        "id": str(data.get("id") or ""),
+        "url": str(data.get("detailUrl") or data.get("url") or ""),
+        "duplicated": False,
+    }
 
 

@@ -11,11 +11,23 @@ from app.repositories.customer_repo import connect, get_company_name
 
 log = logging.getLogger("dispatch_repo")
 
+# 各渠道在销售名单里的用户 ID 列；飞书沿用 open_id，钉钉用 dingtalk_userid
+_CHANNEL_COLUMNS = {"feishu": "open_id", "dingtalk": "dingtalk_userid"}
 
-def list_enabled_assignees() -> list[dict]:
+
+def _channel_column(channel: str) -> tuple[str, str]:
+    """返回 (规范渠道名, sales_assignee 中对应的用户 ID 列)。"""
+    name = (channel or "feishu").strip().lower()
+    return name, _CHANNEL_COLUMNS.get(name, "open_id")
+
+
+def list_enabled_assignees(channel: str = "feishu") -> list[dict]:
+    """按渠道列出可参与轮转的销售，字段统一为 user_id / name。"""
+    _, column = _channel_column(channel)
     sql = (
-        "SELECT `open_id`, `name` FROM `sales_assignee` "
-        "WHERE `enabled` = 1 ORDER BY `sort_order`, `open_id`"
+        f"SELECT `{column}` AS `user_id`, `name` FROM `sales_assignee` "
+        f"WHERE `enabled` = 1 AND `{column}` IS NOT NULL AND `{column}` <> '' "
+        f"ORDER BY `sort_order`, `{column}`"
     )
     conn = connect()
     try:
@@ -26,19 +38,42 @@ def list_enabled_assignees() -> list[dict]:
         conn.close()
 
 
-def next_assignee(conn=None) -> dict | None:
+def find_sales_by_name(name: str, limit: int = 10) -> list[dict]:
+    """按姓名查销售名单里的钉钉 userId，供 Agent 待办工具使用。"""
+    keyword = (name or "").strip()
+    if not keyword:
+        return []
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    limit = max(1, min(int(limit or 10), 20))
+    sql = (
+        "SELECT `dingtalk_userid` AS `user_id`, `name` FROM `sales_assignee` "
+        "WHERE `enabled` = 1 AND `dingtalk_userid` IS NOT NULL "
+        "  AND `dingtalk_userid` <> '' AND `name` LIKE %s "
+        "ORDER BY `sort_order`, `name` LIMIT %s"
+    )
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (f"%{escaped}%", limit))
+            return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def next_assignee(channel: str = "feishu", conn=None) -> dict | None:
     """按 sort_order 轮转取下一个销售；名单为空返回 None。
 
     传入 conn 时复用调用方事务（与通知入队同一事务，避免游标已提交但入队失败），
     此时不 begin / commit / close。
     """
+    name, column = _channel_column(channel)
     if conn is not None:
-        return _next_assignee_locked(conn)
+        return _next_assignee_locked(conn, name, column)
 
     own_conn = connect()
     try:
         own_conn.begin()
-        chosen = _next_assignee_locked(own_conn)
+        chosen = _next_assignee_locked(own_conn, name, column)
         own_conn.commit()
         return chosen
     except pymysql.MySQLError:
@@ -48,29 +83,39 @@ def next_assignee(conn=None) -> dict | None:
         own_conn.close()
 
 
-def _next_assignee_locked(conn) -> dict | None:
+def _next_assignee_locked(conn, channel: str, column: str) -> dict | None:
     with conn.cursor() as cur:
-        cur.execute("SELECT `last_open_id` FROM `dispatch_assignee_cursor` WHERE `id` = 1 FOR UPDATE")
+        # 渠道游标可能还没有行，先保证存在再锁
+        cur.execute(
+            "INSERT IGNORE INTO `dispatch_assignee_cursor` (`channel`, `last_open_id`) "
+            "VALUES (%s, NULL)",
+            (channel,),
+        )
+        cur.execute(
+            "SELECT `last_open_id` FROM `dispatch_assignee_cursor` "
+            "WHERE `channel` = %s FOR UPDATE",
+            (channel,),
+        )
         row = cur.fetchone() or {}
-        last_open_id = row.get("last_open_id")
+        last_user_id = row.get("last_open_id")
 
         cur.execute(
-            "SELECT `open_id`, `name` FROM `sales_assignee` "
-            "WHERE `enabled` = 1 ORDER BY `sort_order`, `open_id`"
+            f"SELECT `{column}` AS `user_id`, `name` FROM `sales_assignee` "
+            f"WHERE `enabled` = 1 AND `{column}` IS NOT NULL AND `{column}` <> '' "
+            f"ORDER BY `sort_order`, `{column}`"
         )
         assignees = list(cur.fetchall())
         if not assignees:
             return None
 
-        open_ids = [item["open_id"] for item in assignees]
-        index = open_ids.index(last_open_id) if last_open_id in open_ids else -1
+        user_ids = [item["user_id"] for item in assignees]
+        index = user_ids.index(last_user_id) if last_user_id in user_ids else -1
         chosen = assignees[(index + 1) % len(assignees)]
 
         cur.execute(
-            "INSERT INTO `dispatch_assignee_cursor` (`id`, `last_open_id`) "
-            "VALUES (1, %s) "
-            "ON DUPLICATE KEY UPDATE `last_open_id` = VALUES(`last_open_id`)",
-            (chosen["open_id"],),
+            "UPDATE `dispatch_assignee_cursor` SET `last_open_id` = %s "
+            "WHERE `channel` = %s",
+            (chosen["user_id"], channel),
         )
     return chosen
 
@@ -84,9 +129,9 @@ def enqueue_notice(notice: dict, conn=None) -> int | None:
     sql = """
     INSERT INTO `dispatch_notice`
       (`credit_code`, `company_name`, `trigger_record_id`, `trigger_phone`,
-       `assignee_open_id`, `assignee_name`, `trigger_source`, `status`,
+       `assignee_open_id`, `assignee_name`, `channel`, `trigger_source`, `status`,
        `analysis_status`, `notice_date`)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, 'PENDING', 'PENDING', %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', 'PENDING', %s)
     ON DUPLICATE KEY UPDATE `id` = LAST_INSERT_ID(`id`)
     """
     values = (
@@ -96,6 +141,7 @@ def enqueue_notice(notice: dict, conn=None) -> int | None:
         notice.get("trigger_phone"),
         notice.get("assignee_open_id"),
         notice.get("assignee_name"),
+        notice.get("channel") or "feishu",
         notice.get("trigger_source") or "SUPPLIER",
         notice.get("notice_date") or date.today(),
     )
@@ -185,15 +231,20 @@ def set_task_guid(notice_id: int, task_guid: str) -> None:
     _update("UPDATE `dispatch_notice` SET `feishu_task_guid` = %s WHERE `id` = %s", (task_guid, int(notice_id)))
 
 
-def mark_sent(notice_id: int, task_guid: str | None, message_id: str | None) -> None:
+def mark_sent(
+    notice_id: int,
+    task_guid: str | None,
+    message_id: str | None,
+    todo_id: str | None = None,
+) -> None:
     # 只允许 SENDING → SENT：若发送期间被 AI 判定撤销（CANCELLED），不覆盖撤销状态
     affected = _update(
         "UPDATE `dispatch_notice` "
         "SET `status` = 'SENT', `sent_at` = NOW(), `feishu_task_guid` = %s, "
-        "    `card_message_id` = %s, `error_msg` = NULL, `next_retry_at` = NULL, "
-        "    `sending_at` = NULL "
+        "    `card_message_id` = %s, `todo_id` = %s, `error_msg` = NULL, "
+        "    `next_retry_at` = NULL, `sending_at` = NULL "
         "WHERE `id` = %s AND `status` = 'SENDING'",
-        (task_guid, message_id, int(notice_id)),
+        (task_guid, message_id, todo_id, int(notice_id)),
     )
     if affected == 0:
         # 典型原因：被超时回收或被 AI 撤销；消息可能已经发出，必须显式告警
@@ -209,6 +260,7 @@ def mark_failed(
     retry_count: int,
     next_retry_at: datetime | None,
     task_guid: str | None = None,
+    todo_id: str | None = None,
 ) -> None:
     """失败回写：还有重试机会就回到 PENDING，否则置 FAILED。
 
@@ -219,9 +271,18 @@ def mark_failed(
         "UPDATE `dispatch_notice` "
         "SET `status` = %s, `error_msg` = %s, `retry_count` = %s, "
         "    `next_retry_at` = %s, `sending_at` = NULL, "
-        "    `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`) "
+        "    `feishu_task_guid` = COALESCE(%s, `feishu_task_guid`), "
+        "    `todo_id` = COALESCE(%s, `todo_id`) "
         "WHERE `id` = %s AND `status` = 'SENDING'",
-        (status, error_msg[:512], int(retry_count), next_retry_at, task_guid, int(notice_id)),
+        (
+            status,
+            error_msg[:512],
+            int(retry_count),
+            next_retry_at,
+            task_guid,
+            todo_id,
+            int(notice_id),
+        ),
     )
     if affected == 0:
         log.warning(
@@ -568,7 +629,7 @@ def cancel_notice(record_id: str, reason: str = "") -> str | None:
         conn.close()
 
 
-def enqueue_ai_notice(record: dict) -> int | None:
+def enqueue_ai_notice(record: dict, channel: str = "feishu") -> int | None:
     """供应商未触发但 AI 判为高意向时补派单，trigger_source 记为 AI。"""
     record_id = str(record.get("record_id") or "").strip()
     credit_code = str(record.get("credit_code") or "").strip()
@@ -577,9 +638,10 @@ def enqueue_ai_notice(record: dict) -> int | None:
         return None
     if get_notice_by_record(record_id):
         return None
-    assignee = next_assignee()
+    channel, _ = _channel_column(channel)
+    assignee = next_assignee(channel)
     if not assignee:
-        log.warning("销售名单为空，通话 %s 无法补派单", record_id)
+        log.warning("销售名单为空，通话 %s 无法补派单（channel=%s）", record_id, channel)
         return None
 
     notice = {
@@ -587,8 +649,9 @@ def enqueue_ai_notice(record: dict) -> int | None:
         "company_name": record.get("customer_name") or get_company_name(credit_code),
         "trigger_record_id": record_id,
         "trigger_phone": record.get("customer_phone"),
-        "assignee_open_id": assignee["open_id"],
+        "assignee_open_id": assignee["user_id"],
         "assignee_name": assignee.get("name"),
+        "channel": channel,
         "trigger_source": "AI",
         "notice_date": date.today(),
     }

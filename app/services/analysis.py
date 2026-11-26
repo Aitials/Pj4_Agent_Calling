@@ -7,7 +7,8 @@ import logging
 from datetime import datetime, timedelta
 
 from app.agents.customer_agent import run_customer_agent
-from app.clients import feishu_api
+from app.clients import dingtalk_api, feishu_api
+from app.core.config import CHANNEL
 from app.repositories import analysis_repo, call_record_repo, dispatch_repo, lead_brief_repo
 from app.services import judge
 
@@ -93,7 +94,7 @@ def _decide(record: dict, analysis: dict) -> None:
         if notice and old_status in ("SENT", "SENDING"):
             _notify_revoke(notice, record, analysis)
     elif decision == judge.PROMOTE:
-        notice_id = dispatch_repo.enqueue_ai_notice(record)
+        notice_id = dispatch_repo.enqueue_ai_notice(record, channel=CHANNEL)
         if notice_id:
             log.info("AI 补派单 record=%s notice=%s", record_id, notice_id)
         else:
@@ -104,8 +105,8 @@ def _decide(record: dict, analysis: dict) -> None:
 
 def _notify_revoke(notice: dict, record: dict, analysis: dict) -> None:
     """通知已发出后 AI 才否决时，补一条撤回提醒，避免销售继续回拨。"""
-    open_id = str(notice.get("assignee_open_id") or "")
-    if not open_id:
+    user_id = str(notice.get("assignee_open_id") or "")
+    if not user_id:
         return
     name = (
         str(record.get("customer_name") or "").strip()
@@ -121,9 +122,15 @@ def _notify_revoke(notice: dict, record: dict, analysis: dict) -> None:
         f"AI 复判：{level}（{reason}）\n"
         f"本次跟进通知已撤销，请勿继续回拨。"
     )
-    digest = hashlib.sha1(f"revoke-{record.get('record_id')}".encode("utf-8")).hexdigest()
+    channel = str(notice.get("channel") or "feishu").strip().lower()
     try:
-        feishu_api.send_text(open_id, text, dedup_key=f"revoke-{digest}")
+        if channel == "dingtalk":
+            dingtalk_api.send_bot_message([user_id], text)
+        else:
+            digest = hashlib.sha1(
+                f"revoke-{record.get('record_id')}".encode("utf-8")
+            ).hexdigest()
+            feishu_api.send_text(user_id, text, dedup_key=f"revoke-{digest}")
     except Exception:  # noqa: BLE001
         log.exception("发送撤回提醒失败 record=%s", record.get("record_id"))
 

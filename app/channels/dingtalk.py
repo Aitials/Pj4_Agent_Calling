@@ -655,11 +655,15 @@ class DingtalkChannel(Channel):
     def _handle_button_callback(self, msg, params: dict, operator: str):
         action, token, extra = _parse_button_id(str(params.get("id") or ""))
         if not action or not token:
+            # 卡片进入客户端重载态时 params 可能只剩 text，按钮 id 丢失。
+            # 明确提示用户重新发起，不再静默丢弃造成「点了没反应」。
             log.warning(
                 "钉钉按钮回调缺少 action/token，已忽略 outTrackId=%s params=%s",
                 msg.card_instance_id,
                 params,
             )
+            if operator:
+                self._dispatch_text(operator, "这张卡片已失效，请重新发起任务状态查询。")
             return AckMessage.STATUS_OK, "OK"
 
         button_id = str(params.get("id") or "")
@@ -685,10 +689,12 @@ class DingtalkChannel(Channel):
         if action in _CLOSE_CARD_ACTIONS:
             self._schedule_close_card(msg.card_instance_id, "已处理，请查看最新消息")
         elif action in ("task_status_pick", "task_status_refresh"):
-            # 概况读取在 Redis 降级时要十几到几十秒：先收敛原卡，
-            # 给用户「正在读取」反馈并让按钮失效，避免连点打出多张卡
-            self._schedule_close_card(
-                msg.card_instance_id, "正在读取任务概况，请稍候…"
+            # 原卡随 ACK 直接置为无按钮失效态：不再另起 update_card 异步任务，
+            # 避免与「发新概况卡」并发写同一张卡导致客户端进入重载态。
+            # 业务层的卡片一次性闸门保证只认第一次点击。
+            return (
+                AckMessage.STATUS_OK,
+                dingtalk_api.button_card_consumed_response("已提交，正在读取任务概况…"),
             )
         return AckMessage.STATUS_OK, "OK"
 
@@ -719,6 +725,12 @@ class DingtalkChannel(Channel):
 
     def _schedule_close_card(self, card_instance_id: str, text: str) -> None:
         task = asyncio.create_task(self._close_card(card_instance_id, text))
+        self._card_tasks.add(task)
+        task.add_done_callback(self._card_tasks.discard)
+
+    def _dispatch_text(self, user_id: str, text: str) -> None:
+        """回调同步路径里安全地追加一条异步文本推送。"""
+        task = asyncio.create_task(self.send_text_to_chat(user_id, text))
         self._card_tasks.add(task)
         task.add_done_callback(self._card_tasks.discard)
 
