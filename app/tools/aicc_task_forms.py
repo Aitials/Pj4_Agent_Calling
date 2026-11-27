@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 
@@ -23,7 +24,10 @@ _OPEN_GUARD_TTL = 600.0
 # 确定性意图校验：不依赖模型自觉，避免「11」这类含糊输入也弹表单
 _CREATE_VERBS = ("创建", "新建", "建一个", "建个", "加一个", "加个", "搭建", "做个")
 _START_VERBS = ("启动", "开始跑", "开始任务", "开跑", "跑起来", "执行任务")
+_PAUSE_VERBS = ("暂停", "停止", "停掉", "先停")
 _TASK_NOUNS = ("任务", "外呼", "机器人", "BOT", "bot", "话术")
+_OPEN_ACTIONS = {"create": "open_create", "start": "open_start", "pause": "open_pause"}
+_ACTION_LABELS = {"create": "创建", "start": "启动", "pause": "暂停"}
 _STATUS_WORDS = (
     "状态", "进度", "概况", "情况", "怎么样", "跑得", "进展", "完成多少", "运行", "跑到",
 )
@@ -37,7 +41,24 @@ def _has_intent(text: str, kind: str) -> bool:
         return any(word in text for word in _CREATE_VERBS) and any(
             word in text for word in _TASK_NOUNS
         )
+    if kind == "pause":
+        return _has_pause_intent(text)
     return any(word in text for word in _START_VERBS)
+
+
+def _has_pause_intent(text: str) -> bool:
+    """暂停必须“明确指向任务”：只有动词没有对象时不发卡。
+
+    满足任一即可：
+    - 停类动词 + 任务名词，如「把昨天的回访任务停掉」；
+    - 停类动词 + 任务 ID，如「暂停 1704345203463」。
+    仅说「暂停」「先停一下」这类没有任务对象的表述，交给模型先反问。
+    """
+    if not any(verb in text for verb in _PAUSE_VERBS):
+        return False
+    if any(noun in text for noun in _TASK_NOUNS):
+        return True
+    return bool(re.search(r"(暂停|停止|停掉)\s*\d{6,}", text))
 
 
 def _guard_key(message) -> str:
@@ -74,7 +95,7 @@ def _open(kind: str) -> str:
         return "当前渠道暂不支持表单卡片。"
 
     if not _has_intent(message.text, kind):
-        action = "创建" if kind == "create" else "启动"
+        action = _ACTION_LABELS.get(kind, "操作")
         return (
             f"用户当前这句话没有明确表达“{action}外呼任务”的意图，已取消发卡。"
             f"请先向用户确认是否要{action}任务，确认后再调用本工具。"
@@ -91,7 +112,7 @@ def _open(kind: str) -> str:
             "请立即停止调用任何工具，直接用一句话回复用户，提醒其在卡片中填写并提交。"
         )
 
-    action = "open_create" if kind == "create" else "open_start"
+    action = _OPEN_ACTIONS.get(kind, "open_create")
     asyncio.run_coroutine_threadsafe(
         aicc_task_flow.handle_action(
             channel,
@@ -137,6 +158,22 @@ def open_start_task_form() -> str:
     返回：发卡结果提示；成功后应立即停止调用工具，用一句话提醒用户选择并确认。
     """
     return _open("start")
+
+
+@tool(parse_docstring=True)
+def open_pause_task_form() -> str:
+    """打开「暂停外呼任务」表单卡片（不会直接暂停任务）。
+
+    何时使用：用户明确要求停掉某个外呼任务，例如「把昨天的回访任务暂停」「停掉任务 1704345203463」。
+    不要使用：只说了「暂停」「先停一下」但没指向任何任务；查询状态、创建或启动任务；
+              也不要自己猜测任务 ID，不确定要停哪个任务时先反问。
+              本工具只做「暂停/停止任务」，用户要的是「终止」时不要调用。
+    参数：无。卡片会列出进行中 / 排队中 / 可运行的任务，也支持手填任务 ID。
+    副作用：会向当前会话发送一张表单卡片；同一条消息最多发一次。
+            不会真正暂停任务，用户确认后才执行。
+    返回：发卡结果提示；成功后应立即停止调用工具，用一句话提醒用户选择并确认。
+    """
+    return _open("pause")
 
 
 def _has_status_intent(text: str) -> bool:

@@ -12,7 +12,7 @@ import logging
 from app.cards import cards
 from app.clients import aicc_options
 from app.core import forms
-from app.tools import aicc_task, aicc_task_status
+from app.tools import aicc_task, aicc_task_openapi, aicc_task_status
 
 log = logging.getLogger("aicc_flow")
 
@@ -99,6 +99,20 @@ async def open_start_form(channel, chat_id: str, operator: str, message_id: str 
     )
     jobs = await asyncio.to_thread(aicc_options.startable_jobs)
     card = cards.build_start_form(token=token, jobs=jobs)
+    await channel.send_card_to_chat(chat_id, card)
+
+
+async def open_pause_form(channel, chat_id: str, operator: str, message_id: str = "") -> None:
+    """暂停任务：候选任务走 openapi（只列运行中三类）。"""
+    token = forms.register(
+        kind="pause",
+        step="step1",
+        operator=operator,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    jobs = await asyncio.to_thread(aicc_task_openapi.pausable_jobs)
+    card = cards.build_pause_form(token=token, jobs=jobs)
     await channel.send_card_to_chat(chat_id, card)
 
 
@@ -312,11 +326,16 @@ async def handle_action(
         if action in ("debug_open_start", "open_start"):
             await open_start_form(channel, chat_id, operator, message_id)
             return
+        if action in ("debug_open_pause", "open_pause"):
+            await open_pause_form(channel, chat_id, operator, message_id)
+            return
 
         if action == "task_form_refresh":
             kind = str(value.get("kind") or "create")
             if kind == "start":
                 await open_start_form(channel, chat_id, operator, message_id)
+            elif kind == "pause":
+                await open_pause_form(channel, chat_id, operator, message_id)
             else:
                 await open_create_form(channel, chat_id, operator, message_id)
             return
@@ -396,6 +415,13 @@ async def handle_action(
             return
         if action == "task_start_confirm":
             await _start_confirm(channel, token, operator, chat_id)
+            return
+
+        if action == "task_pause_step1":
+            await _pause_step1(channel, token, form_value, operator, chat_id, message_id)
+            return
+        if action == "task_pause_confirm":
+            await _pause_confirm(channel, token, operator, chat_id)
             return
 
         log.warning("未知的卡片动作：%s", action)
@@ -672,6 +698,66 @@ async def _start_confirm(channel, token, operator, chat_id) -> None:
         chat_id,
         cards.build_result(
             "启动指令已提交" if result.startswith("✅") else "启动任务失败",
+            result,
+            ok=result.startswith("✅"),
+        ),
+    )
+
+
+async def _pause_step1(channel, token, form_value, operator, chat_id, message_id) -> None:
+    record = _require_record(token, operator, "pause")
+    if not record:
+        await channel.send_text_to_chat(chat_id, "这张表单已过期，请重新发起暂停任务。")
+        return
+
+    raw = form_value.get("robot_call_job_id_select") or form_value.get("robot_call_job_id")
+    try:
+        job_id = _as_int(raw, "任务 ID")
+    except ValueError as exc:
+        jobs = await asyncio.to_thread(aicc_task_openapi.pausable_jobs)
+        await channel.send_card_to_chat(
+            chat_id, cards.build_pause_form(token=token, jobs=jobs, error=str(exc))
+        )
+        return
+
+    try:
+        brief = await asyncio.to_thread(aicc_task_openapi.job_brief, job_id)
+    except Exception as exc:  # noqa: BLE001
+        jobs = await asyncio.to_thread(aicc_task_openapi.pausable_jobs)
+        await channel.send_card_to_chat(
+            chat_id,
+            cards.build_pause_form(token=token, jobs=jobs, error=f"读取任务失败：{exc}"),
+        )
+        return
+
+    forms.update(token, step="confirm", data={"robot_call_job_id": job_id})
+    fields = [
+        ("任务 ID", brief.get("id")),
+        ("任务名称", brief.get("name")),
+        ("当前状态", brief.get("status_label") or brief.get("status")),
+        ("话术", brief.get("dialog_flow_name")),
+        ("线路类型", brief.get("phone_type")),
+        ("并发 / BOT", f"{brief.get('concurrency')} / {brief.get('robot_count')}"),
+        ("拨打时段", brief.get("daily")),
+    ]
+    await channel.send_card_to_chat(
+        chat_id, cards.build_task_confirm(token=token, kind="pause", fields=fields)
+    )
+
+
+async def _pause_confirm(channel, token, operator, chat_id) -> None:
+    record, reason = forms.pop_for(token, operator)
+    if reason != "ok" or not record:
+        text = "该确认已过期或已处理，请重新发起暂停任务。" if reason != "forbidden" else "这不是你的操作。"
+        await channel.send_text_to_chat(chat_id, text)
+        return
+    job_id = int((record.get("data") or {}).get("robot_call_job_id") or 0)
+    log.info("开始暂停外呼任务：%s", job_id)
+    result = await asyncio.to_thread(aicc_task_openapi.pause_task, job_id)
+    await channel.send_card_to_chat(
+        chat_id,
+        cards.build_result(
+            "暂停指令已提交" if result.startswith("✅") else "暂停任务失败",
             result,
             ok=result.startswith("✅"),
         ),

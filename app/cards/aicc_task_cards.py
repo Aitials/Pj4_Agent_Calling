@@ -334,13 +334,72 @@ def build_start_form(*, token: str, jobs: list[dict], error: str = "") -> dict:
     return _base_card("启动外呼任务", elements, template="turquoise")
 
 
+def build_pause_form(*, token: str, jobs: list[dict], error: str = "") -> dict:
+    """暂停任务：只列运行中三类，下拉选择 + 手填 ID 兜底。"""
+    elements: list[dict] = []
+    if error:
+        elements.append(_error_line(error))
+
+    job_options = [
+        _option(f"{row.get('name')}（{row.get('status')}）", row.get("id")) for row in jobs or []
+    ]
+    if not job_options:
+        elements.append(
+            _markdown(
+                "当前没有进行中 / 排队中 / 可运行的任务。"
+                "可手填任务 ID，或稍后点「刷新任务列表」。"
+            )
+        )
+    form_elements: list[dict] = []
+    if job_options:
+        form_elements.append(
+            _select("robot_call_job_id_select", "选择任务", job_options, placeholder="请选择要暂停的任务")
+        )
+    form_elements.append(
+        _input("robot_call_job_id", "或手填任务 ID", placeholder="选项里没有时可手填任务 ID")
+    )
+    form_elements.append(_submit_button("下一步", "task_pause_step1", {"token": token}))
+
+    elements.append(
+        {
+            "tag": "form",
+            "name": "pause_task",
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": form_elements,
+        }
+    )
+    elements.append(
+        _columns(
+            _callback_button("刷新任务列表", "task_form_refresh", {"kind": "pause"}),
+            _callback_button("取消", "task_form_cancel", {"token": token}),
+        )
+    )
+    return _base_card("暂停外呼任务", elements, template="orange")
+
+
+_CONFIRM_TITLES = {
+    "create": "确认创建外呼任务",
+    "start": "确认启动外呼任务",
+    "pause": "确认暂停外呼任务",
+}
+_CONFIRM_ACTIONS = {
+    "create": "task_create_confirm",
+    "start": "task_start_confirm",
+    "pause": "task_pause_confirm",
+}
+
+
 def build_task_confirm(*, token: str, kind: str, fields: list[tuple[str, Any]]) -> dict:
     """二次确认卡：只读摘要 + 确认/取消。"""
     lines = ["确认后才会真正提交到一知平台：", ""]
     for label, value in fields:
         lines.append(f"- **{label}**：{value if value not in (None, '') else '-'}")
-    title = "确认创建外呼任务" if kind == "create" else "确认启动外呼任务"
-    action = "task_create_confirm" if kind == "create" else "task_start_confirm"
+    if kind == "pause":
+        lines.append("")
+        lines.append("暂停为软暂停：当前正在跑的通话结束后才会生效。")
+    title = _CONFIRM_TITLES.get(kind, _CONFIRM_TITLES["start"])
+    action = _CONFIRM_ACTIONS.get(kind, _CONFIRM_ACTIONS["start"])
     return _base_card(
         title,
         [

@@ -8,6 +8,7 @@ from __future__ import annotations
 from app.tools.aicc_dashboard import query_aicc_dashboard
 from app.tools.aicc_task_forms import (
     open_create_task_form,
+    open_pause_task_form,
     open_start_task_form,
     query_aicc_task_status,
 )
@@ -22,6 +23,7 @@ ALL_TOOLS = [
     query_aicc_task_status,
     open_create_task_form,
     open_start_task_form,
+    open_pause_task_form,
     find_feishu_member,
     send_feishu_message,
     create_feishu_task,
@@ -34,13 +36,14 @@ FEISHU_ONLY = (
     create_feishu_task,
 )
 
-# 钉钉：通用查询 + 创建 + 启动 + 状态 + 待办（4.6 全放行，阶段 6 加待办）
+# 钉钉：通用查询 + 创建 + 启动 + 暂停 + 状态 + 待办
 DINGTALK_TOOLS = (
     query_customer_profile,
     query_aicc_dashboard,
     query_aicc_task_status,
     open_create_task_form,
     open_start_task_form,
+    open_pause_task_form,
     create_dingtalk_todo,
 )
 
@@ -70,6 +73,7 @@ __all__ = [
     "create_feishu_task",
     "find_feishu_member",
     "open_create_task_form",
+    "open_pause_task_form",
     "open_start_task_form",
     "query_aicc_dashboard",
     "query_aicc_task_status",

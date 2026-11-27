@@ -377,6 +377,61 @@ def build_start_form(*, token: str, jobs: list[dict], error: str = "") -> dict:
     )
 
 
+def build_pause_form(*, token: str, jobs: list[dict], error: str = "") -> dict:
+    """暂停任务：只列运行中三类，下拉选择 + 手填 ID 兜底。"""
+    job_options = [
+        _option(f"{row.get('name')}（{row.get('status')}）", row.get("id"))
+        for row in jobs or []
+        if row.get("id") is not None
+    ]
+    fields: list[dict] = []
+    if not job_options:
+        fields.append(
+            _text(
+                "__hint",
+                "提示",
+                default="当前没有进行中 / 排队中 / 可运行的任务；可手填任务 ID，或稍后重新打开本卡片",
+                read_only=True,
+            )
+        )
+    if job_options:
+        fields.append(
+            _select(
+                "robot_call_job_id_select",
+                "选择任务",
+                job_options,
+                placeholder="请选择要暂停的任务",
+            )
+        )
+    fields.append(
+        _text(
+            "robot_call_job_id",
+            "或手填任务 ID",
+            placeholder="选项里没有时可手填任务 ID",
+        )
+    )
+    return _form_card(
+        "暂停外呼任务",
+        token=token,
+        action="task_pause_step1",
+        fields=fields,
+        btn_text="下一步",
+        error=error,
+    )
+
+
+_CONFIRM_TITLES = {
+    "create": "确认创建外呼任务",
+    "start": "确认启动外呼任务",
+    "pause": "确认暂停外呼任务",
+}
+_CONFIRM_ACTIONS = {
+    "create": "task_create_confirm",
+    "start": "task_start_confirm",
+    "pause": "task_pause_confirm",
+}
+
+
 def build_task_confirm(
     *, token: str, kind: str, fields: list[tuple[str, Any]]
 ) -> dict:
@@ -384,8 +439,11 @@ def build_task_confirm(
     lines = ["确认后才会真正提交到一知平台：", ""]
     for label, value in fields:
         lines.append(f"- **{label}**：{value if value not in (None, '') else '-'}")
-    title = "确认创建外呼任务" if kind == "create" else "确认启动外呼任务"
-    action = "task_create_confirm" if kind == "create" else "task_start_confirm"
+    if kind == "pause":
+        lines.append("")
+        lines.append("暂停为软暂停：当前正在跑的通话结束后才会生效。")
+    title = _CONFIRM_TITLES.get(kind, _CONFIRM_TITLES["start"])
+    action = _CONFIRM_ACTIONS.get(kind, _CONFIRM_ACTIONS["start"])
     return {
         "kind": "buttons",
         "title": title,
