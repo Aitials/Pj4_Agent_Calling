@@ -8,7 +8,6 @@ __pycache__/
 state/
 .workbuddy/
 .screenshots/
-.idea/vcs.xml
 AI messages/
 # 本地 md 文档不纳入版本库
 *.md
